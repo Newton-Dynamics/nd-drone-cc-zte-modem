@@ -1,0 +1,114 @@
+#!/bin/bash
+# This file goes to /etc/NetworkManager/dispatcher.d/
+# Purpose: Handle ZTE modem interface events, prefer Wi‑Fi routes, and run modem workflow.
+
+set -Eeuo pipefail
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+iface="${1:-}"
+state="${2:-}"
+
+LOGTAG="nd-nm-dispatcher"
+SCRIPT_NAME="$(basename "$0")"
+
+# --- helpers -----------------------------------------------------------------
+
+log() {
+  # Uniform, greppable log format
+  # Usage: log "message"
+  /usr/bin/logger -t "$LOGTAG" "$SCRIPT_NAME: $*"
+}
+
+die() {
+  # Log an error and exit non-zero (keeps behavior obvious)
+  log "ERROR: $*"
+  exit 1
+}
+
+cleanup() {
+  # Hook for future use; currently just records abnormal exits.
+  # shellcheck disable=SC2181
+  if [[ $? -ne 0 ]]; then
+    log "ABORTED: an error occurred (trap caught)."
+  fi
+}
+trap cleanup EXIT
+
+# --- start -------------------------------------------------------------------
+
+log "Dispatcher triggered: interface=${iface:-<empty>}, status=${state:-<empty>}"
+
+# Only act on ZTE interface when it goes up
+# NOTE: Do not alter overall logic — keep exact condition semantics.
+if [[ "$iface" =~ ^(enx|eth1|usb0) ]] && [[ "$state" =~ ^(pre-up|up)$ ]]; then
+  log "[$iface] state: $state - entering handler"
+
+  # Lock to avoid concurrent runs
+  if ! command -v flock >/dev/null 2>&1; then
+    die "flock not found in PATH"
+  fi
+  exec 9>/run/zte_dispatcher.lock
+  if ! flock -n 9; then
+    log "[$iface] state: $state - another instance holding lock, exiting"
+    exit 0
+  fi
+
+  log "[$iface] state: $state - lock acquired"
+
+  export ZTE_ENV_FILE="/opt/zte/.env"
+
+  script="/opt/zte/zte_http.sh"
+  if [[ ! -r "$script" ]]; then
+    die "Script not readable: $script"
+  fi
+
+  # Give NM a moment to settle interfaces/routes
+  sleep 2
+
+  ###
+  ### Routing fix: Wi‑Fi MUST stay default route
+  ### (Preserve behavior, improve parsing clarity)
+  ###
+  ZTE_IF="$iface"
+  # Connection bound to the active ZTE interface
+  ZTE_CON=$(nmcli -t -f NAME,DEVICE con show | grep ":$ZTE_IF" | cut -d: -f1 || true)
+
+  # Detect active Wi‑Fi interface and connection
+  WIFI_IF=$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi"{print $1; exit}' || true)
+  WIFI_CON=""
+  if [[ -n "$WIFI_IF" ]]; then
+    WIFI_CON=$(nmcli -t -f NAME,DEVICE con show | grep ":$WIFI_IF" | cut -d: -f1 || true)
+  fi
+
+  if [[ -n "$WIFI_CON" ]]; then
+    nmcli con modify "$WIFI_CON" ipv4.route-metric 50 >/dev/null 2>&1 || log "WARN: failed to set metric on Wi‑Fi connection: $WIFI_CON"
+  else
+    log "INFO: No Wi‑Fi connection found to prioritize"
+  fi
+
+  if [[ -n "$ZTE_CON" ]]; then
+    nmcli con modify "$ZTE_CON" ipv4.route-metric 700 >/dev/null 2>&1 || log "WARN: failed to set IPv4 metric on ZTE connection: $ZTE_CON"
+    nmcli con modify "$ZTE_CON" ipv6.route-metric 700 >/dev/null 2>&1 || log "WARN: failed to set IPv6 metric on ZTE connection: $ZTE_CON"
+  else
+    log "INFO: No ZTE connection found for interface: $ZTE_IF"
+  fi
+
+  log "Routing metrics applied (Wi‑Fi preferred over LTE). Starting modem handler…"
+
+  # Only run the modem workflow when it's meaningful
+  if [[ "$state" != "dhcp4-change" ]]; then
+    # Intentionally keep sudo + invocation style to avoid behavior change.
+    /usr/bin/sudo -u root -H /bin/bash -lc "/bin/bash '$script' 2>&1" | /usr/bin/logger -t nd_zte &
+    log "Modem handler started in background (PID $!)"
+  else
+    log "Skipping modem workflow on state=$state"
+  fi
+
+  log "[$iface] state: $state - handler done"
+else
+  # Improve observability for ignored events without being noisy
+  # Only log if the dispatcher is noisy (optional level)
+  # Examples seen: interface=none/empty with hostname/connectivity-change
+  log "Ignoring event: interface=${iface:-<empty>} state=${state:-<empty>}"
+fi
