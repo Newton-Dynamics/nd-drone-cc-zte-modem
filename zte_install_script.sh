@@ -197,6 +197,8 @@ EOF
 perform_install() {
     msg "Installing ZTE modem scripts…"
 
+    check_dependencies install
+
     mkdir -p "$ZTE_DIR"
     ok "Created directory: $ZTE_DIR"
 
@@ -407,12 +409,23 @@ activate_now() {
 ### check_dependencies
 ### ---------------------------------------------------------------------------
 check_dependencies() {
+    local mode="${1:-dry-run}"
     msg "Checking required packages…"
 
-    local missing=()
+    # tool → apt package name (tool name used as fallback if not listed here)
+    declare -A pkg_map=(
+        [sha256sum]="coreutils"
+        [md5sum]="coreutils"
+        [logger]="bsdutils"
+        [jq]="jq"
+        [curl]="curl"
+        [awk]="gawk"
+        [sed]="sed"
+        [grep]="grep"
+    )
 
-    # Required tools
     local deps=(curl jq awk sed grep sha256sum md5sum logger)
+    local missing=()
 
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
@@ -420,31 +433,67 @@ check_dependencies() {
         fi
     done
 
-    if (( ${#missing[@]} )); then
-        warn "Missing required packages: ${missing[*]}"
+    if (( ${#missing[@]} == 0 )); then
+        ok "All required dependencies are installed."
+        return 0
+    fi
 
-        # Suggest installation based on distro
-        if command -v apt >/dev/null 2>&1; then
-            echo "Install them via:"
-            echo "    sudo apt update"
-            echo "    sudo apt install ${missing[*]}"
-        elif command -v dnf >/dev/null 2>&1; then
-            echo "Install them via:"
-            echo "    sudo dnf install ${missing[*]}"
-        elif command -v pacman >/dev/null 2>&1; then
-            echo "Install them via:"
-            echo "    sudo pacman -Sy ${missing[*]}"
-        else
-            echo "Please install the missing dependencies manually."
-        fi
+    warn "Missing: ${missing[*]}"
 
-        # Exit only for install mode, not dry-run
-        if [[ "${1:-}" == "install" ]]; then
-            err "Cannot continue without required packages."
+    if [[ "$mode" == "dry-run" ]]; then
+        # Just report what would be installed
+        local pkgs=()
+        for dep in "${missing[@]}"; do
+            pkgs+=("${pkg_map[$dep]:-$dep}")
+        done
+        # deduplicate
+        local unique_pkgs
+        unique_pkgs=$(printf '%s\n' "${pkgs[@]}" | sort -u | tr '\n' ' ')
+        msg "Would install: $unique_pkgs"
+        return 0
+    fi
+
+    # install mode — actually install
+    if command -v apt-get >/dev/null 2>&1; then
+        local pkgs=()
+        for dep in "${missing[@]}"; do
+            pkgs+=("${pkg_map[$dep]:-$dep}")
+        done
+        # deduplicate
+        local unique_pkgs
+        mapfile -t unique_pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+
+        msg "Installing: ${unique_pkgs[*]}"
+        apt-get update -qq || { err "apt-get update failed"; exit 1; }
+        apt-get install -y "${unique_pkgs[@]}" || { err "apt-get install failed"; exit 1; }
+
+        # verify everything is now available
+        local still_missing=()
+        for dep in "${missing[@]}"; do
+            command -v "$dep" >/dev/null 2>&1 || still_missing+=("$dep")
+        done
+        if (( ${#still_missing[@]} )); then
+            err "Still missing after install: ${still_missing[*]}"
             exit 1
         fi
+        ok "All dependencies installed."
+    elif command -v dnf >/dev/null 2>&1; then
+        local pkgs=()
+        for dep in "${missing[@]}"; do pkgs+=("${pkg_map[$dep]:-$dep}"); done
+        local unique_pkgs
+        mapfile -t unique_pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+        msg "Installing: ${unique_pkgs[*]}"
+        dnf install -y "${unique_pkgs[@]}" || { err "dnf install failed"; exit 1; }
+    elif command -v pacman >/dev/null 2>&1; then
+        local pkgs=()
+        for dep in "${missing[@]}"; do pkgs+=("${pkg_map[$dep]:-$dep}"); done
+        local unique_pkgs
+        mapfile -t unique_pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+        msg "Installing: ${unique_pkgs[*]}"
+        pacman -Sy --noconfirm "${unique_pkgs[@]}" || { err "pacman install failed"; exit 1; }
     else
-        ok "All required dependencies are installed."
+        err "No supported package manager found. Install manually: ${missing[*]}"
+        exit 1
     fi
 }
 

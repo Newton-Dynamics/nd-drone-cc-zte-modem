@@ -67,8 +67,8 @@ if [[ "$iface" =~ ^(enx|eth1|usb0) ]] && [[ "$state" =~ ^(pre-up|up)$ ]]; then
   sleep 2
 
   ###
-  ### Routing fix: Wi‑Fi MUST stay default route
-  ### (Preserve behavior, improve parsing clarity)
+  ### Routing policy: LTE (ZTE) is the PREFERRED uplink.
+  ### LTE gets the lowest metric; Wi‑Fi is the fallback (higher metric).
   ###
   ZTE_IF="$iface"
   # Connection bound to the active ZTE interface
@@ -82,19 +82,19 @@ if [[ "$iface" =~ ^(enx|eth1|usb0) ]] && [[ "$state" =~ ^(pre-up|up)$ ]]; then
   fi
 
   if [[ -n "$WIFI_CON" ]]; then
-    nmcli con modify "$WIFI_CON" ipv4.route-metric 50 >/dev/null 2>&1 || log "WARN: failed to set metric on Wi‑Fi connection: $WIFI_CON"
+    nmcli con modify "$WIFI_CON" ipv4.route-metric 600 >/dev/null 2>&1 || log "WARN: failed to set metric on Wi‑Fi connection: $WIFI_CON"
   else
     log "INFO: No Wi‑Fi connection found to prioritize"
   fi
 
   if [[ -n "$ZTE_CON" ]]; then
-    nmcli con modify "$ZTE_CON" ipv4.route-metric 700 >/dev/null 2>&1 || log "WARN: failed to set IPv4 metric on ZTE connection: $ZTE_CON"
-    nmcli con modify "$ZTE_CON" ipv6.route-metric 700 >/dev/null 2>&1 || log "WARN: failed to set IPv6 metric on ZTE connection: $ZTE_CON"
+    nmcli con modify "$ZTE_CON" ipv4.route-metric 50 >/dev/null 2>&1 || log "WARN: failed to set IPv4 metric on ZTE connection: $ZTE_CON"
+    nmcli con modify "$ZTE_CON" ipv6.route-metric 50 >/dev/null 2>&1 || log "WARN: failed to set IPv6 metric on ZTE connection: $ZTE_CON"
   else
     log "INFO: No ZTE connection found for interface: $ZTE_IF"
   fi
 
-  log "Routing metrics applied (Wi‑Fi preferred over LTE). Starting modem handler…"
+  log "Routing metrics applied (LTE preferred over Wi‑Fi). Starting modem handler…"
 
   # Only run the modem workflow when it's meaningful
   if [[ "$state" != "dhcp4-change" ]]; then

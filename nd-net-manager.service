@@ -1,0 +1,22 @@
+[Unit]
+Description=Newton network failover manager (WiFi client/hotspot + Ethernet DHCP fallback)
+Documentation=file:/opt/nd-net/nd-net-manager.sh
+After=NetworkManager.service
+Wants=NetworkManager.service
+# NM must be talkable-to before we start driving connections.
+Requires=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/opt/nd-net/nd-net-manager.sh
+# Remove the LTE-only firewall chain on stop so a stopped manager never leaves
+# LAN clients stranded. (The running daemon also clears it on SIGTERM.)
+ExecStop=/opt/nd-net/nd-net-manager.sh fw-clear
+Restart=always
+RestartSec=5
+# Give the loop a clean SIGTERM stop.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
