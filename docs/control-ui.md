@@ -13,9 +13,13 @@ Jetson networking stack. Installed to `/opt/nd-net/nd-net-ui.py`, run by
   keys (matched by `PASSWORD|PIN|PSK|SECRET|TOKEN|KEY` suffix) are masked with a
   reveal toggle; a blank secret field keeps the stored value. Writes preserve
   comments / `export` prefixes / line order, atomic, 0600.
-- **Devices panel**: list/add/remove LTE sticks and SIM cards (the
-  [registry](modem-device-registry.md)). Secrets masked, server-side
-  validation, HTML-escaped output.
+- **Unlock mode banner**: states plainly which secret-source is in effect —
+  **MULTI-DEVICE** (registry has entries), **SINGLE-DEVICE** (registry empty,
+  using the `/opt/zte/.env` `ZTE_PASSWORD`/`ZTE_PIN` fallback — same as before
+  the registry existed), or **NO secrets configured**.
+- **LTE sticks** and **SIM cards** sections: each has a separate "registered"
+  list panel and an "add" panel. Secrets masked, server-side validation,
+  HTML-escaped output. See the [registry](modem-device-registry.md).
 - **Service control**: start / stop / restart `nd-net-manager`.
 - `/api/status` (JSON) and `/healthz`.
 

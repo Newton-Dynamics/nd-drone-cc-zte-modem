@@ -274,6 +274,9 @@ PAGE = """<!doctype html>
                   font-size:11px; text-transform:uppercase; letter-spacing:.05em;
                   border-bottom:1px solid var(--line); padding:4px 6px; }}
   .addform {{ margin-top:12px; padding-top:10px; border-top:1px solid var(--line); }}
+  .active-ok {{ border-left:3px solid var(--ok); }}
+  .active-warn {{ border-left:3px solid var(--warn); }}
+  .active-bad {{ border-left:3px solid var(--bad); }}
   input[type=text], input[type=password] {{ width:100%; font:inherit;
             background:var(--bg); color:var(--fg); border:1px solid var(--line);
             border-radius:5px; padding:5px 8px; }}
@@ -308,6 +311,7 @@ PAGE = """<!doctype html>
 <div class="wrap">
   {flash}
   <div class="grid">
+    {active_mode}
     {devices}
     {env_panels}
     <div class="panel full">
@@ -387,20 +391,60 @@ def render_modem(fields):
             rows.append(f'<tr><td class="k">{esc(k)}</td><td>{esc(str(fields[k]))}</td></tr>')
     return f'<table class="env"><tbody>{"".join(rows)}</tbody></table>'
 
-def render_devices():
+def _env_fallback_active():
+    """True if /opt/zte/.env still carries a single-device ZTE_PASSWORD/ZTE_PIN
+    that the unlock would fall back to when the registry has no match."""
+    try:
+        pairs = dict(parse_env(ENV_FILES["zte"]["path"])[0])  # (pairs, raw)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(pairs.get("ZTE_PASSWORD")) or bool(pairs.get("ZTE_PIN"))
+
+
+def render_active_mode():
+    """A banner stating, in plain terms, which unlock secret-source is in effect:
+    the multi-device registry, or the legacy single-device .env fallback."""
     if REG is None:
-        return ('<div class="panel full"><h2>devices</h2>'
-                '<span class="muted">registry module not available '
-                '(nd-modem-registry.py not found)</span></div>')
+        return ''
     try:
         view = REG.public_view(reveal=False)
-    except Exception as e:  # noqa: BLE001
-        return (f'<div class="panel full"><h2>devices</h2>'
-                f'<span class="muted">registry error: {esc(str(e))}</span></div>')
+        n_sticks, n_sims = len(view["sticks"]), len(view["sims"])
+    except Exception:  # noqa: BLE001
+        n_sticks = n_sims = 0
+    env_fb = _env_fallback_active()
 
-    stick_rows = []
+    if n_sticks or n_sims:
+        title = "MULTI-DEVICE mode active"
+        detail = (f"The unlock matches each modem against the registry "
+                  f"({n_sticks} stick(s), {n_sims} SIM(s)) — the login password "
+                  f"by the stick's IMEI, the PIN by the inserted SIM's IMSI.")
+        if env_fb:
+            detail += (" The legacy ZTE_PASSWORD/ZTE_PIN in /opt/zte/.env are "
+                       "kept only as a fallback for a modem with no registry match.")
+        cls = "ok"
+    elif env_fb:
+        title = "SINGLE-DEVICE mode active (.env fallback)"
+        detail = ("The registry is empty, so the unlock uses the single "
+                  "ZTE_PASSWORD / ZTE_PIN from /opt/zte/.env — exactly as before. "
+                  "Add a stick + SIM below to switch to multi-device matching.")
+        cls = "warn"
+    else:
+        title = "NO unlock secrets configured"
+        detail = ("The registry is empty and /opt/zte/.env has no ZTE_PASSWORD / "
+                  "ZTE_PIN — the modem cannot be unlocked. Add a stick + SIM below, "
+                  "or set the .env fallback.")
+        cls = "bad"
+
+    return (f'<div class="panel full active-{cls}">'
+            f'<h2>unlock mode</h2>'
+            f'<div class="row"><span class="pill {cls}">{esc(title)}</span></div>'
+            f'<p class="muted" style="margin-top:8px">{esc(detail)}</p></div>')
+
+
+def _stick_table(view):
+    rows = []
     for s in view["sticks"]:
-        stick_rows.append(
+        rows.append(
             f'<tr><td class="k">{esc(s["imei"])}</td>'
             f'<td>{esc(s["password"])}</td>'
             f'<td>{esc(s["label"])}</td>'
@@ -410,12 +454,15 @@ def render_devices():
             f'<input type="hidden" name="op" value="rm-stick">'
             f'<input type="hidden" name="imei" value="{esc(s["imei"])}">'
             f'<button class="bad">remove</button></form></td></tr>')
-    if not stick_rows:
-        stick_rows.append('<tr><td colspan="5" class="muted">no sticks registered</td></tr>')
+    if not rows:
+        rows.append('<tr><td colspan="5" class="muted">no LTE sticks registered</td></tr>')
+    return ''.join(rows)
 
-    sim_rows = []
+
+def _sim_table(view):
+    rows = []
     for s in view["sims"]:
-        sim_rows.append(
+        rows.append(
             f'<tr><td class="k">{esc(s["imsi"])}</td>'
             f'<td>{esc(s["pin"])}</td>'
             f'<td>{esc(s["label"])}</td>'
@@ -425,46 +472,75 @@ def render_devices():
             f'<input type="hidden" name="op" value="rm-sim">'
             f'<input type="hidden" name="imsi" value="{esc(s["imsi"])}">'
             f'<button class="bad">remove</button></form></td></tr>')
-    if not sim_rows:
-        sim_rows.append('<tr><td colspan="5" class="muted">no SIMs registered</td></tr>')
+    if not rows:
+        rows.append('<tr><td colspan="5" class="muted">no SIM cards registered</td></tr>')
+    return ''.join(rows)
 
+
+def render_devices():
+    if REG is None:
+        return ('<div class="panel full"><h2>LTE sticks</h2>'
+                '<span class="muted">registry module not available '
+                '(nd-modem-registry.py not found)</span></div>')
+    try:
+        view = REG.public_view(reveal=False)
+    except Exception as e:  # noqa: BLE001
+        return (f'<div class="panel full"><h2>LTE sticks</h2>'
+                f'<span class="muted">registry error: {esc(str(e))}</span></div>')
+
+    # Four distinct panels: a list + a separate "add" section for sticks, and the
+    # same for SIM cards. Add-forms are visually separated from the lists.
     return f"""
     <div class="panel full">
-      <h2>devices · LTE sticks (IMEI → login password)</h2>
+      <h2>LTE sticks — registered</h2>
       <table class="env"><thead><tr>
         <th>IMEI</th><th>password</th><th>label</th><th>last seen</th><th></th>
-      </tr></thead><tbody>{''.join(stick_rows)}</tbody></table>
-      <form method="post" action="/device" class="addform">
+      </tr></thead><tbody>{_stick_table(view)}</tbody></table>
+    </div>
+    <div class="panel full">
+      <h2>add an LTE stick</h2>
+      <p class="muted" style="margin:0 0 10px">
+        The modem login password belongs to the stick hardware, matched by its IMEI.
+      </p>
+      <form method="post" action="/device">
         <input type="hidden" name="op" value="add-stick">
-        <div class="row">
-          <input type="text" name="imei" placeholder="IMEI (14-16 digits)" required>
-          <input type="password" name="password" placeholder="login password" required>
-          <button type="button" class="reveal" onclick="tog(this)">👁</button>
-          <input type="text" name="label" placeholder="label (optional)">
-          <button>add stick</button>
-        </div>
+        <table class="env"><tbody>
+          <tr><td class="k">IMEI</td><td>
+            <input type="text" name="imei" placeholder="14-16 digits" required></td></tr>
+          <tr><td class="k">password</td><td><div class="row">
+            <input type="password" name="password" placeholder="modem login password" required>
+            <button type="button" class="reveal" onclick="tog(this)">👁</button></div></td></tr>
+          <tr><td class="k">label</td><td>
+            <input type="text" name="label" placeholder="optional (e.g. stick-A)"></td></tr>
+        </tbody></table>
+        <div class="row" style="margin-top:10px"><button>add stick</button></div>
       </form>
     </div>
     <div class="panel full">
-      <h2>devices · SIM cards (IMSI → PIN)</h2>
+      <h2>SIM cards — registered</h2>
       <table class="env"><thead><tr>
         <th>IMSI</th><th>PIN</th><th>label</th><th>last seen</th><th></th>
-      </tr></thead><tbody>{''.join(sim_rows)}</tbody></table>
-      <form method="post" action="/device" class="addform">
-        <input type="hidden" name="op" value="add-sim">
-        <div class="row">
-          <input type="text" name="imsi" placeholder="IMSI (6-15 digits)" required>
-          <input type="password" name="pin" placeholder="PIN (4-8 digits)" required>
-          <button type="button" class="reveal" onclick="tog(this)">👁</button>
-          <input type="text" name="label" placeholder="label (optional)">
-          <button>add SIM</button>
-        </div>
-      </form>
-      <p class="muted" style="margin-top:8px">
-        The login password belongs to the stick (matched by IMEI); the PIN
-        belongs to the SIM (matched by IMSI). A SIM moved into another stick
-        keeps its PIN; a stick taking another SIM uses that SIM's PIN.
+      </tr></thead><tbody>{_sim_table(view)}</tbody></table>
+    </div>
+    <div class="panel full">
+      <h2>add a SIM card</h2>
+      <p class="muted" style="margin:0 0 10px">
+        The PIN belongs to the SIM card, matched by its IMSI. A SIM keeps its PIN
+        when moved into another stick.
       </p>
+      <form method="post" action="/device">
+        <input type="hidden" name="op" value="add-sim">
+        <table class="env"><tbody>
+          <tr><td class="k">IMSI</td><td>
+            <input type="text" name="imsi" placeholder="6-15 digits" required></td></tr>
+          <tr><td class="k">PIN</td><td><div class="row">
+            <input type="password" name="pin" placeholder="4-8 digits" required>
+            <button type="button" class="reveal" onclick="tog(this)">👁</button></div></td></tr>
+          <tr><td class="k">label</td><td>
+            <input type="text" name="label" placeholder="optional (e.g. carrier name)"></td></tr>
+        </tbody></table>
+        <div class="row" style="margin-top:10px"><button>add SIM</button></div>
+      </form>
     </div>"""
 
 
@@ -485,6 +561,7 @@ def render_page(flash=None):
         service=esc(SERVICE),
         svc_pill=svc_pill(state),
         flash=flash_html,
+        active_mode=render_active_mode(),
         devices=render_devices(),
         env_panels=env_panels,
         status=esc(status_text()),
