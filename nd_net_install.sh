@@ -22,12 +22,18 @@ STATUS_SRC="./nd-net-status.sh"
 LIB_SRC="./nd-net-lib.sh"
 SERVICE_SRC="./nd-net-manager.service"
 DISPATCHER_SRC="./00-nd-nm-dispatcher-zte-modem.sh"
+UI_SRC="./nd-net-ui.py"
+UI_SERVICE_SRC="./nd-net-ui.service"
+UI_ENV_SRC="./nd-net-ui.env.example"
 
 MANAGER_DST="$ND_DIR/nd-net-manager.sh"
 STATUS_DST="$ND_DIR/nd-net-status.sh"
 LIB_DST="$ND_DIR/nd-net-lib.sh"
 STATUS_LINK="/usr/local/bin/nd-net-status"
 SERVICE_DST="/etc/systemd/system/nd-net-manager.service"
+UI_DST="$ND_DIR/nd-net-ui.py"
+UI_ENV_DST="$ND_DIR/nd-net-ui.env"
+UI_SERVICE_DST="/etc/systemd/system/nd-net-ui.service"
 
 HOTSPOT_CON="nd-hotspot"
 ETH_CLIENT_CON="Wired connection 1"
@@ -66,7 +72,7 @@ detect_eth_dev() {
 check_deps() {
   local mode="${1:-dry-run}"
   msg "Checking required tools…"
-  local deps=(nmcli dnsmasq iw wpa_supplicant flock logger curl awk sed)
+  local deps=(nmcli dnsmasq iw wpa_supplicant flock logger curl awk sed python3)
   local missing=()
   for d in "${deps[@]}"; do command -v "$d" >/dev/null 2>&1 || missing+=("$d"); done
   if (( ${#missing[@]} == 0 )); then
@@ -107,9 +113,13 @@ preflight() {
     warn "Profile '$ETH_CLIENT_CON' not found — a manager-driven probe profile will be created"
   fi
 
-  for f in "$MANAGER_SRC" "$STATUS_SRC" "$LIB_SRC" "$SERVICE_SRC"; do
+  for f in "$MANAGER_SRC" "$STATUS_SRC" "$LIB_SRC" "$SERVICE_SRC" \
+           "$UI_SRC" "$UI_SERVICE_SRC" "$UI_ENV_SRC"; do
     [[ -f "$f" ]] && ok "Found $f" || err "Missing $f"
   done
+
+  command -v python3 >/dev/null 2>&1 && ok "python3 present (required by nd-net-ui)" \
+    || err "python3 not found — required by the nd-net-ui control panel"
 
   # Hygiene preview: report (do not kill) any foreign dnsmasq/hostapd on our ifaces.
   if [[ -r "$LIB_SRC" ]]; then
@@ -132,6 +142,7 @@ preflight() {
   msg "Would create NM profiles: $HOTSPOT_CON (AP/shared), $ETH_SERVER_CON (eth shared=DEFAULT)"
   msg "Ethernet default role: SERVE DHCP+NAT; probe upstream on link-up (client only if found)"
   msg "Would install: $LIB_DST, $MANAGER_DST, $STATUS_DST, $SERVICE_DST, symlink $STATUS_LINK"
+  msg "Would install control UI: $UI_DST + $UI_SERVICE_DST (LAN-bound, no auth — see $UI_ENV_DST)"
   msg "Would set LTE preferred (metric $LTE_METRIC) over WiFi (metric $WIFI_METRIC) in the ZTE dispatcher"
   msg "Would enforce STRICT LTE-only egress for LAN clients (tagged ND_FWD chain)"
   msg "Cleanup scope: only foreign DHCP/AP daemons on our ifaces — usb0/BlueOS/Docker untouched"
@@ -263,6 +274,19 @@ perform_install() {
   ln -sf "$STATUS_DST" "$STATUS_LINK"
   ok "Installed lib + manager + status; '$STATUS_LINK' → status command."
 
+  # --- control UI ---
+  msg "Installing control UI (nd-net-ui)…"
+  install -m 0755 "$UI_SRC" "$UI_DST"
+  # Seed the UI's env file only if absent, so we never clobber a tuned bind list.
+  if [[ -f "$UI_ENV_DST" ]]; then
+    ok "UI config '$UI_ENV_DST' exists — leaving it unchanged."
+  else
+    install -m 0644 "$UI_ENV_SRC" "$UI_ENV_DST"
+    ok "Seeded UI config '$UI_ENV_DST' (LAN/hotspot-bound, no auth)."
+  fi
+  install -m 0644 "$UI_SERVICE_SRC" "$UI_SERVICE_DST"
+  ok "Installed control UI to $UI_DST + $UI_SERVICE_DST."
+
   # --- one-shot hygiene pass (reap foreign daemons on our ifaces) ---
   msg "Running initial hygiene pass…"
   "$MANAGER_DST" reap || warn "Hygiene pass reported an issue (continuing)"
@@ -274,6 +298,8 @@ perform_install() {
   systemctl daemon-reload
   systemctl enable --now nd-net-manager.service
   ok "nd-net-manager.service enabled and started."
+  systemctl enable --now nd-net-ui.service
+  ok "nd-net-ui.service enabled and started."
 
   # --- one-shot firewall pass (install ND_FWD immediately) ---
   msg "Applying LTE-only egress firewall…"
@@ -303,6 +329,15 @@ perform_install() {
   echo
   msg "Check status any time with:  nd-net-status"
   msg "Watch decisions live with:   journalctl -t nd-net -f"
+  echo
+  msg "Control UI (status + .env editor + service start/stop/restart):"
+  echo "  • Reachable from the hotspot/LAN at  http://10.42.0.1:8088  (WiFi clients)"
+  echo "    or  http://10.42.1.1:8088  (ethernet-served devices)."
+  echo "  • NO authentication — protected only by binding to LAN/hotspot IPs."
+  echo "    Edit the bind list / port in  $UI_ENV_DST  (do NOT add 0.0.0.0)."
+  echo "  • Edits to the .env files take effect after restarting nd-net-manager"
+  echo "    (there's a restart button in the UI)."
+  echo "  • Logs:  journalctl -u nd-net-ui -f"
 }
 
 ### --- status ---------------------------------------------------------------

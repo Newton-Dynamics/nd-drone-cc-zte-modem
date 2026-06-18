@@ -1,0 +1,19 @@
+[Unit]
+Description=Newton network control UI (status + .env editor, LAN-bound)
+Documentation=file:/opt/nd-net/nd-net-ui.py
+After=network.target nd-net-manager.service
+Wants=nd-net-manager.service
+
+[Service]
+Type=simple
+# Runs as root: reads/writes the 0600 secret-bearing .env files and controls
+# nd-net-manager via systemctl. Bound to LAN/hotspot IPs only (see ND_UI_BIND).
+EnvironmentFile=-/opt/nd-net/nd-net-ui.env
+ExecStart=/usr/bin/env python3 /opt/nd-net/nd-net-ui.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
