@@ -25,6 +25,7 @@
 #   ND_UI_STATUS_CMD  status command to run (default: nd-net-status)
 #
 import html
+import importlib.util
 import json
 import os
 import re
@@ -55,6 +56,24 @@ ENV_FILES = {
     "zte":    {"label": "ZTE modem (/opt/zte/.env)",    "path": ZTE_ENV_FILE},
     "nd_net": {"label": "nd-net manager (/opt/nd-net/.env)", "path": ND_NET_ENV_FILE},
 }
+
+# Device registry module (sticks/SIMs). Loaded from a sibling file (repo) or the
+# installed path. If it can't be loaded the device panel degrades gracefully.
+def _load_registry_module():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "nd-modem-registry.py"),
+                 "/opt/nd-net/nd-modem-registry.py"):
+        if os.path.exists(cand):
+            try:
+                spec = importlib.util.spec_from_file_location("nd_modem_registry", cand)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+            except Exception as e:  # noqa: BLE001
+                print(f"[nd-net-ui] registry module load failed ({cand}): {e}", flush=True)
+    return None
+
+REG = _load_registry_module()
 
 # Keys whose values are secret: masked in the form, only written when changed.
 SECRET_KEY_RE = re.compile(r"(PASSWORD|PASSWD|PSK|PIN|SECRET|TOKEN|KEY)$", re.I)
@@ -251,6 +270,10 @@ PAGE = """<!doctype html>
   table.env {{ width:100%; border-collapse:collapse; }}
   table.env td {{ padding:5px 6px; vertical-align:middle; }}
   table.env td.k {{ color:var(--accent); white-space:nowrap; padding-right:12px; }}
+  table.env th {{ text-align:left; color:var(--muted); font-weight:600;
+                  font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+                  border-bottom:1px solid var(--line); padding:4px 6px; }}
+  .addform {{ margin-top:12px; padding-top:10px; border-top:1px solid var(--line); }}
   input[type=text], input[type=password] {{ width:100%; font:inherit;
             background:var(--bg); color:var(--fg); border:1px solid var(--line);
             border-radius:5px; padding:5px 8px; }}
@@ -285,6 +308,7 @@ PAGE = """<!doctype html>
 <div class="wrap">
   {flash}
   <div class="grid">
+    {devices}
     {env_panels}
     <div class="panel full">
       <h2>nd-net-status</h2>
@@ -363,6 +387,87 @@ def render_modem(fields):
             rows.append(f'<tr><td class="k">{esc(k)}</td><td>{esc(str(fields[k]))}</td></tr>')
     return f'<table class="env"><tbody>{"".join(rows)}</tbody></table>'
 
+def render_devices():
+    if REG is None:
+        return ('<div class="panel full"><h2>devices</h2>'
+                '<span class="muted">registry module not available '
+                '(nd-modem-registry.py not found)</span></div>')
+    try:
+        view = REG.public_view(reveal=False)
+    except Exception as e:  # noqa: BLE001
+        return (f'<div class="panel full"><h2>devices</h2>'
+                f'<span class="muted">registry error: {esc(str(e))}</span></div>')
+
+    stick_rows = []
+    for s in view["sticks"]:
+        stick_rows.append(
+            f'<tr><td class="k">{esc(s["imei"])}</td>'
+            f'<td>{esc(s["password"])}</td>'
+            f'<td>{esc(s["label"])}</td>'
+            f'<td class="muted">{esc(str(s["last_seen"] or "—"))}</td>'
+            f'<td><form class="act" method="post" action="/device" '
+            f'onsubmit="return confirm(\'Remove stick {esc(s["imei"])}?\')">'
+            f'<input type="hidden" name="op" value="rm-stick">'
+            f'<input type="hidden" name="imei" value="{esc(s["imei"])}">'
+            f'<button class="bad">remove</button></form></td></tr>')
+    if not stick_rows:
+        stick_rows.append('<tr><td colspan="5" class="muted">no sticks registered</td></tr>')
+
+    sim_rows = []
+    for s in view["sims"]:
+        sim_rows.append(
+            f'<tr><td class="k">{esc(s["imsi"])}</td>'
+            f'<td>{esc(s["pin"])}</td>'
+            f'<td>{esc(s["label"])}</td>'
+            f'<td class="muted">{esc(str(s["last_seen"] or "—"))}</td>'
+            f'<td><form class="act" method="post" action="/device" '
+            f'onsubmit="return confirm(\'Remove SIM {esc(s["imsi"])}?\')">'
+            f'<input type="hidden" name="op" value="rm-sim">'
+            f'<input type="hidden" name="imsi" value="{esc(s["imsi"])}">'
+            f'<button class="bad">remove</button></form></td></tr>')
+    if not sim_rows:
+        sim_rows.append('<tr><td colspan="5" class="muted">no SIMs registered</td></tr>')
+
+    return f"""
+    <div class="panel full">
+      <h2>devices · LTE sticks (IMEI → login password)</h2>
+      <table class="env"><thead><tr>
+        <th>IMEI</th><th>password</th><th>label</th><th>last seen</th><th></th>
+      </tr></thead><tbody>{''.join(stick_rows)}</tbody></table>
+      <form method="post" action="/device" class="addform">
+        <input type="hidden" name="op" value="add-stick">
+        <div class="row">
+          <input type="text" name="imei" placeholder="IMEI (14-16 digits)" required>
+          <input type="password" name="password" placeholder="login password" required>
+          <button type="button" class="reveal" onclick="tog(this)">👁</button>
+          <input type="text" name="label" placeholder="label (optional)">
+          <button>add stick</button>
+        </div>
+      </form>
+    </div>
+    <div class="panel full">
+      <h2>devices · SIM cards (IMSI → PIN)</h2>
+      <table class="env"><thead><tr>
+        <th>IMSI</th><th>PIN</th><th>label</th><th>last seen</th><th></th>
+      </tr></thead><tbody>{''.join(sim_rows)}</tbody></table>
+      <form method="post" action="/device" class="addform">
+        <input type="hidden" name="op" value="add-sim">
+        <div class="row">
+          <input type="text" name="imsi" placeholder="IMSI (6-15 digits)" required>
+          <input type="password" name="pin" placeholder="PIN (4-8 digits)" required>
+          <button type="button" class="reveal" onclick="tog(this)">👁</button>
+          <input type="text" name="label" placeholder="label (optional)">
+          <button>add SIM</button>
+        </div>
+      </form>
+      <p class="muted" style="margin-top:8px">
+        The login password belongs to the stick (matched by IMEI); the PIN
+        belongs to the SIM (matched by IMSI). A SIM moved into another stick
+        keeps its PIN; a stick taking another SIM uses that SIM's PIN.
+      </p>
+    </div>"""
+
+
 def svc_pill(state):
     cls = {"active": "ok", "failed": "bad"}.get(state, "warn")
     return f'<span class="pill {cls}">{esc(state or "unknown")}</span>'
@@ -380,6 +485,7 @@ def render_page(flash=None):
         service=esc(SERVICE),
         svc_pill=svc_pill(state),
         flash=flash_html,
+        devices=render_devices(),
         env_panels=env_panels,
         status=esc(status_text()),
         svc_status=esc(service_status()),
@@ -451,6 +557,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_svc()
         elif path == "/env":
             self._handle_env()
+        elif path == "/device":
+            self._handle_device()
         else:
             self._send(404, "not found\n", "text/plain; charset=utf-8")
 
@@ -497,6 +605,35 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._flash_redirect("ok", f"saved {os.path.basename(meta['path'])} "
                                    f"({len(updates)} key(s)) — restart to apply")
+
+    def _handle_device(self):
+        if REG is None:
+            self._flash_redirect("err", "registry module not available")
+            return
+        form = self._read_form()
+        op = form.get("op", [""])[0]
+        g = lambda k: (form.get(k, [""])[0] or "").strip()  # noqa: E731
+        try:
+            if op == "add-stick":
+                imei = REG.add_stick(g("imei"), g("password"), g("label"))
+                self._flash_redirect("ok", f"added/updated stick {imei}")
+            elif op == "add-sim":
+                imsi = REG.add_sim(g("imsi"), g("pin"), g("label"))
+                self._flash_redirect("ok", f"added/updated SIM {imsi}")
+            elif op == "rm-stick":
+                n = REG.rm_stick(g("imei"))
+                self._flash_redirect("ok" if n else "err",
+                                     f"removed stick {g('imei')}" if n else "stick not found")
+            elif op == "rm-sim":
+                n = REG.rm_sim(g("imsi"))
+                self._flash_redirect("ok" if n else "err",
+                                     f"removed SIM {g('imsi')}" if n else "SIM not found")
+            else:
+                self._flash_redirect("err", f"unknown device op: {op}")
+        except REG.RegistryError as e:
+            self._flash_redirect("err", str(e))
+        except Exception as e:  # noqa: BLE001
+            self._flash_redirect("err", f"device op failed: {e}")
 
     def log_message(self, fmt, *args):  # quieter; one line to stderr
         import sys

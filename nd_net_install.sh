@@ -25,6 +25,7 @@ DISPATCHER_SRC="./00-nd-nm-dispatcher-zte-modem.sh"
 UI_SRC="./nd-net-ui.py"
 UI_SERVICE_SRC="./nd-net-ui.service"
 UI_ENV_SRC="./nd-net-ui.env.example"
+REGISTRY_SRC="./nd-modem-registry.py"
 
 MANAGER_DST="$ND_DIR/nd-net-manager.sh"
 STATUS_DST="$ND_DIR/nd-net-status.sh"
@@ -34,6 +35,9 @@ SERVICE_DST="/etc/systemd/system/nd-net-manager.service"
 UI_DST="$ND_DIR/nd-net-ui.py"
 UI_ENV_DST="$ND_DIR/nd-net-ui.env"
 UI_SERVICE_DST="/etc/systemd/system/nd-net-ui.service"
+REGISTRY_DST="$ND_DIR/nd-modem-registry.py"
+REGISTRY_LINK="/usr/local/bin/nd-modem-registry"
+REGISTRY_DB="$ND_DIR/devices.json"
 
 HOTSPOT_CON="nd-hotspot"
 ETH_CLIENT_CON="Wired connection 1"
@@ -114,7 +118,7 @@ preflight() {
   fi
 
   for f in "$MANAGER_SRC" "$STATUS_SRC" "$LIB_SRC" "$SERVICE_SRC" \
-           "$UI_SRC" "$UI_SERVICE_SRC" "$UI_ENV_SRC"; do
+           "$UI_SRC" "$UI_SERVICE_SRC" "$UI_ENV_SRC" "$REGISTRY_SRC"; do
     [[ -f "$f" ]] && ok "Found $f" || err "Missing $f"
   done
 
@@ -143,6 +147,7 @@ preflight() {
   msg "Ethernet default role: SERVE DHCP+NAT; probe upstream on link-up (client only if found)"
   msg "Would install: $LIB_DST, $MANAGER_DST, $STATUS_DST, $SERVICE_DST, symlink $STATUS_LINK"
   msg "Would install control UI: $UI_DST + $UI_SERVICE_DST (LAN-bound, no auth — see $UI_ENV_DST)"
+  msg "Would install device registry: $REGISTRY_DST (symlink $REGISTRY_LINK), DB $REGISTRY_DB (0600)"
   msg "Would set LTE preferred (metric $LTE_METRIC) over WiFi (metric $WIFI_METRIC) in the ZTE dispatcher"
   msg "Would enforce STRICT LTE-only egress for LAN clients (tagged ND_FWD chain)"
   msg "Cleanup scope: only foreign DHCP/AP daemons on our ifaces — usb0/BlueOS/Docker untouched"
@@ -274,6 +279,23 @@ perform_install() {
   ln -sf "$STATUS_DST" "$STATUS_LINK"
   ok "Installed lib + manager + status; '$STATUS_LINK' → status command."
 
+  # --- device registry (multi-stick / multi-SIM secrets) ---
+  msg "Installing device registry (nd-modem-registry)…"
+  install -m 0755 "$REGISTRY_SRC" "$REGISTRY_DST"
+  ln -sf "$REGISTRY_DST" "$REGISTRY_LINK"
+  # Create the DB empty + 0600 if absent so the first UI/CLI write doesn't have
+  # to, and so it never lands world-readable with secrets in it.
+  if [[ ! -f "$REGISTRY_DB" ]]; then
+    install -m 0600 /dev/null "$REGISTRY_DB"
+    printf '{\n  "version": 1,\n  "sticks": [],\n  "sims": [],\n  "last_login": {}\n}\n' > "$REGISTRY_DB"
+    chmod 0600 "$REGISTRY_DB"
+    ok "Created empty registry DB '$REGISTRY_DB' (0600)."
+  else
+    chmod 0600 "$REGISTRY_DB" || true
+    ok "Registry DB '$REGISTRY_DB' exists — left in place (perms forced 0600)."
+  fi
+  ok "Registry CLI: '$REGISTRY_LINK' (add-stick / add-sim / list …)."
+
   # --- control UI ---
   msg "Installing control UI (nd-net-ui)…"
   install -m 0755 "$UI_SRC" "$UI_DST"
@@ -338,6 +360,16 @@ perform_install() {
   echo "  • Edits to the .env files take effect after restarting nd-net-manager"
   echo "    (there's a restart button in the UI)."
   echo "  • Logs:  journalctl -u nd-net-ui -f"
+  echo
+  msg "Multi-device modem unlock (sticks + SIM cards):"
+  echo "  • Add an LTE stick (IMEI → login password) and a SIM (IMSI → PIN) in"
+  echo "    the UI 'devices' panel, or via the CLI:"
+  echo "        nd-modem-registry add-stick --imei <IMEI> --password <pw> --label <name>"
+  echo "        nd-modem-registry add-sim   --imsi <IMSI> --pin <pin>     --label <name>"
+  echo "  • On modem up, the unlock picks the password by the stick's IMEI and the"
+  echo "    PIN by the inserted SIM's IMSI — so SIMs can move between sticks freely."
+  echo "  • Secrets live ONLY in $REGISTRY_DB (0600, root). ZTE_PASSWORD/ZTE_PIN in"
+  echo "    /opt/zte/.env remain as an optional single-device fallback."
 }
 
 ### --- status ---------------------------------------------------------------
@@ -347,10 +379,25 @@ run_status() {
   else err "status script not found"; exit 1; fi
 }
 
+### --- test (offline, no hardware) -----------------------------------------
+run_tests() {
+  msg "Running offline test suite (registry unit tests + mock-modem e2e)…"
+  local rc=0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 ./tests/test_registry.py || rc=1
+  else
+    err "python3 not found — cannot run tests"; return 1
+  fi
+  bash ./tests/test_unlock_e2e.sh || rc=1
+  (( rc == 0 )) && ok "All offline tests passed." || err "Some tests failed."
+  return $rc
+}
+
 ### --- main -----------------------------------------------------------------
 case "${1:-}" in
   --dry-run) preflight ;;
   --install) perform_install ;;
   --status)  run_status ;;
-  *) echo "Usage: $0 --dry-run | --install | --status"; exit 1 ;;
+  --test)    run_tests ;;
+  *) echo "Usage: $0 --dry-run | --install | --status | --test"; exit 1 ;;
 esac

@@ -1,0 +1,8 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Runtime secret stores — never commit. These are created on the device.
+devices.json
+.env
+nd-net-ui.env
