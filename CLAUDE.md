@@ -29,6 +29,10 @@ Everything installs under `/opt/nd-net` (and `/opt/zte` for the modem half).
   tables, not one. Login bootstrap handles the IMEI/password chicken-and-egg.
 - **[Control UI](docs/control-ui.md)** — stdlib-only, **no auth, LAN-bound**,
   runs as root. Trust boundary = the device + the hotspot.
+- **[Docker DNS fix](docs/docker-dns-fix.md)** — plug-in USB NICs (`enx*`) can
+  hand the host a hijacking resolver that poisons registry lookups
+  (`auth.docker.io → 192.168.50.x → i/o timeout`). The installer disables DNS +
+  default-route from `enx*` NICs and pins the docker daemon to public DNS.
 - **[Offline testing](docs/offline-testing.md)** — `./nd_net_install.sh --test`
   runs the whole unlock flow against a mock modem with no hardware. **Note the
   compact-JSON gotcha documented there.**

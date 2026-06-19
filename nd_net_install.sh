@@ -39,6 +39,13 @@ REGISTRY_DST="$ND_DIR/nd-modem-registry.py"
 REGISTRY_LINK="/usr/local/bin/nd-modem-registry"
 REGISTRY_DB="$ND_DIR/devices.json"
 
+# Docker daemon DNS override (source-of-truth keys merged into daemon.json).
+# Pins the daemon/BuildKit to public resolvers so a flaky LAN DNS that returns
+# a bogus private IP for registry hosts (e.g. auth.docker.io) can't blackhole
+# image pulls. See docs/docker-dns-fix.md.
+DOCKER_DNS_SRC="./docker-daemon-dns.json"
+DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+
 HOTSPOT_CON="nd-hotspot"
 ETH_CLIENT_CON="Wired connection 1"
 ETH_SERVER_CON="nd-eth-dhcp-server"
@@ -71,12 +78,19 @@ detect_eth_dev() {
   nmcli -t -f DEVICE,TYPE device 2>/dev/null \
     | awk -F: '$2=="ethernet" && $1 ~ /^(en|eth)/ && $1 !~ /^enx/ {print $1; exit}'
 }
+# USB ethernet NICs (enx*): plug-in appliance/test nets. These are NOT our WAN
+# and must never inject DNS or a default route — some hand out a hijacking
+# resolver that poisons registry lookups (see docs/docker-dns-fix.md).
+detect_usb_eth_devs() {
+  nmcli -t -f DEVICE,TYPE device 2>/dev/null \
+    | awk -F: '$2=="ethernet" && $1 ~ /^enx/ {print $1}'
+}
 
 ### --- dependency check -----------------------------------------------------
 check_deps() {
   local mode="${1:-dry-run}"
   msg "Checking required tools…"
-  local deps=(nmcli dnsmasq iw wpa_supplicant flock logger curl awk sed python3)
+  local deps=(nmcli dnsmasq iw wpa_supplicant flock logger curl awk sed python3 jq)
   local missing=()
   for d in "${deps[@]}"; do command -v "$d" >/dev/null 2>&1 || missing+=("$d"); done
   if (( ${#missing[@]} == 0 )); then
@@ -118,7 +132,8 @@ preflight() {
   fi
 
   for f in "$MANAGER_SRC" "$STATUS_SRC" "$LIB_SRC" "$SERVICE_SRC" \
-           "$UI_SRC" "$UI_SERVICE_SRC" "$UI_ENV_SRC" "$REGISTRY_SRC"; do
+           "$UI_SRC" "$UI_SERVICE_SRC" "$UI_ENV_SRC" "$REGISTRY_SRC" \
+           "$DOCKER_DNS_SRC"; do
     [[ -f "$f" ]] && ok "Found $f" || err "Missing $f"
   done
 
@@ -150,6 +165,17 @@ preflight() {
   msg "Would install device registry: $REGISTRY_DST (symlink $REGISTRY_LINK), DB $REGISTRY_DB (0600)"
   msg "Would set LTE preferred (metric $LTE_METRIC) over WiFi (metric $WIFI_METRIC) in the ZTE dispatcher"
   msg "Would enforce STRICT LTE-only egress for LAN clients (tagged ND_FWD chain)"
+  local usb_nics; usb_nics="$(detect_usb_eth_devs | paste -sd' ' - )"
+  if [[ -n "$usb_nics" ]]; then
+    warn "USB ethernet NIC(s) present: $usb_nics — would disable their DNS + default route (anti-hijack)"
+  else
+    msg "No USB ethernet NICs (enx*) — nothing to neutralize for DNS hygiene"
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    msg "Would merge DNS $(jq -rc '.dns' "$DOCKER_DNS_SRC" 2>/dev/null) into $DOCKER_DAEMON_JSON (preserves other keys) + restart docker"
+  else
+    msg "Docker not installed — would skip the daemon DNS fix"
+  fi
   msg "Cleanup scope: only foreign DHCP/AP daemons on our ifaces — usb0/BlueOS/Docker untouched"
   msg "Dry-run complete. No changes made."
 }
@@ -249,23 +275,31 @@ perform_install() {
 
   local wifi eth
   wifi="$(detect_wifi_dev || true)"; eth="$(detect_eth_dev || true)"
-  [[ -n "$wifi" ]] || { err "No WiFi device found — aborting."; exit 1; }
+  # WiFi is OPTIONAL: with no adapter we skip the hotspot rather than abort, so
+  # the ethernet/LTE half can still deploy on hardware that has no WiFi.
+  [[ -n "$wifi" ]] || warn "No WiFi device found — skipping hotspot; ethernet/LTE will still be configured."
   [[ -n "$eth"  ]] || { err "No onboard ethernet device found — aborting."; exit 1; }
-  ok "WiFi=$wifi  Ethernet=$eth"
+  ok "WiFi=${wifi:-<none>}  Ethernet=$eth"
 
-  # --- hotspot credentials ---
+  # --- hotspot credentials (only when a WiFi adapter is present) ---
   local ssid psk psk2
-  read -rp "Hotspot SSID [ND-JETSON]: " ssid; ssid="${ssid:-ND-JETSON}"
-  while :; do
-    read -rsp "Hotspot passphrase (min 8 chars): " psk;  echo
-    read -rsp "Repeat passphrase: "               psk2; echo
-    [[ "$psk" != "$psk2" ]] && { warn "Passphrases differ — try again."; continue; }
-    (( ${#psk} < 8 )) && { warn "Too short (WPA needs >= 8) — try again."; continue; }
-    break
-  done
+  if [[ -n "$wifi" ]]; then
+    read -rp "Hotspot SSID [ND-JETSON]: " ssid; ssid="${ssid:-ND-JETSON}"
+    while :; do
+      read -rsp "Hotspot passphrase (min 8 chars): " psk;  echo
+      read -rsp "Repeat passphrase: "               psk2; echo
+      [[ "$psk" != "$psk2" ]] && { warn "Passphrases differ — try again."; continue; }
+      (( ${#psk} < 8 )) && { warn "Too short (WPA needs >= 8) — try again."; continue; }
+      break
+    done
+  fi
 
   # --- NM profiles ---
-  create_hotspot "$wifi" "$ssid" "$psk"
+  if [[ -n "$wifi" ]]; then
+    create_hotspot "$wifi" "$ssid" "$psk"
+  else
+    msg "Skipping hotspot profile (no WiFi adapter)."
+  fi
   create_eth_server "$eth"
   tune_eth_client "$eth"
   fix_dispatcher_metrics
@@ -328,6 +362,11 @@ perform_install() {
   "$MANAGER_DST" fw-apply || warn "Firewall pass reported an issue (continuing)"
   ok "LTE-only firewall applied (ND_FWD)."
 
+  # --- DNS hygiene: stop rogue USB-NIC resolvers from poisoning lookups ---
+  # (primary fix) then pin the docker daemon to public DNS as a backstop.
+  neutralize_usb_nic_dns || warn "USB-NIC DNS neutralization reported an issue (continuing)"
+  install_docker_dns      || warn "Docker DNS fix reported an issue (continuing)"
+
   echo
   ok "Installation complete."
   echo
@@ -370,6 +409,94 @@ perform_install() {
   echo "    PIN by the inserted SIM's IMSI — so SIMs can move between sticks freely."
   echo "  • Secrets live ONLY in $REGISTRY_DB (0600, root). ZTE_PASSWORD/ZTE_PIN in"
   echo "    /opt/zte/.env remain as an optional single-device fallback."
+}
+
+### --- rogue DNS neutralization (USB NICs) ----------------------------------
+# Stop plug-in USB ethernet NICs (enx*) from contributing DNS or a default
+# route to the system resolver. systemd-resolved races DNS across all links and
+# uses the first reply; a captive/hijacking resolver on such a NIC (observed:
+# 192.168.0.1 answering every name with a dead 192.168.50.x IP) then wins some
+# races and blackholes registry pulls (auth.docker.io → i/o timeout). The WAN
+# uplink (onboard eth / LTE) must own DNS. Idempotent; safe with zero USB NICs.
+neutralize_usb_nic_dns() {
+  local devs; devs="$(detect_usb_eth_devs || true)"
+  if [[ -z "$devs" ]]; then
+    msg "No USB ethernet NICs (enx*) present — no rogue DNS to neutralize."
+    return 0
+  fi
+  local dev con changed=0
+  while read -r dev; do
+    [[ -n "$dev" ]] || continue
+    con="$(nmcli -t -f GENERAL.CONNECTION device show "$dev" 2>/dev/null | cut -d: -f2)"
+    if [[ -z "$con" || "$con" == "--" ]]; then
+      warn "USB NIC $dev has no active NM connection — skipping."
+      continue
+    fi
+    msg "Neutralizing DNS/default-route from USB NIC $dev (connection '$con')…"
+    nmcli con modify "$con" \
+      ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes \
+      ipv4.never-default yes ipv6.never-default yes \
+      ipv4.dns-priority 200 ipv6.dns-priority 200
+    nmcli con up "$con" >/dev/null 2>&1 || warn "Could not re-activate '$con' (settings saved; apply on next up)."
+    ok "USB NIC $dev: won't inject DNS or a default route."
+    changed=1
+  done <<<"$devs"
+  [[ "$changed" == 1 ]] && resolvectl flush-caches 2>/dev/null || true
+  return 0
+}
+
+### --- docker DNS fix -------------------------------------------------------
+# Merge our DNS keys into /etc/docker/daemon.json without clobbering any other
+# daemon settings the host may already carry. Idempotent: re-running is a no-op
+# once the keys match. Restarts dockerd only when the file actually changed and
+# Docker is installed. Safe on machines that have no Docker at all (skips).
+install_docker_dns() {
+  if ! command -v docker >/dev/null 2>&1; then
+    msg "Docker not installed — skipping daemon DNS fix."
+    return 0
+  fi
+  [[ -r "$DOCKER_DNS_SRC" ]] || { warn "Missing $DOCKER_DNS_SRC — skipping Docker DNS fix."; return 0; }
+
+  msg "Applying Docker daemon DNS override (merge into $DOCKER_DAEMON_JSON)…"
+  mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
+
+  local current merged tmp
+  if [[ -s "$DOCKER_DAEMON_JSON" ]]; then
+    current="$(cat "$DOCKER_DAEMON_JSON")"
+    # Bail loudly rather than overwrite a daemon.json we can't parse.
+    if ! printf '%s' "$current" | jq -e . >/dev/null 2>&1; then
+      err "$DOCKER_DAEMON_JSON exists but is not valid JSON — leaving it untouched."
+      err "Fix it by hand, then merge keys from $DOCKER_DNS_SRC."
+      return 1
+    fi
+  else
+    current='{}'
+  fi
+
+  # Right-hand side wins: our dns[] replaces any existing dns key, all else kept.
+  merged="$(printf '%s' "$current" | jq -S --slurpfile add "$DOCKER_DNS_SRC" '. * $add[0]')"
+
+  if [[ "$(printf '%s' "$current" | jq -S .)" == "$merged" ]]; then
+    ok "Docker daemon DNS already set — no change."
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  printf '%s\n' "$merged" > "$tmp"
+  install -m 0644 "$tmp" "$DOCKER_DAEMON_JSON"
+  rm -f "$tmp"
+  ok "Wrote DNS override to $DOCKER_DAEMON_JSON."
+
+  if systemctl is-active --quiet docker; then
+    msg "Restarting docker to pick up new DNS…"
+    if systemctl restart docker; then
+      ok "docker restarted; daemon/BuildKit now resolve via $(jq -r '.dns|join(", ")' "$DOCKER_DNS_SRC")."
+    else
+      warn "docker restart failed — apply manually: sudo systemctl restart docker"
+    fi
+  else
+    ok "DNS override staged; will take effect on next docker start."
+  fi
 }
 
 ### --- status ---------------------------------------------------------------
