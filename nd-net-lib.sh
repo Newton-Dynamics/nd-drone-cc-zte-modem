@@ -149,7 +149,16 @@ nd_fw_apply() {
   "$ND_IPT" -t filter -I FORWARD 1 -j "$ND_CHAIN" 2>/dev/null
 
   # No served LAN subnets -> nothing to police; empty chain just RETURNs.
-  (( ${#subnets[@]} )) || { nd_log "fw: no served subnets; ND_FWD empty (lte='${lte:-none}')"; return 0; }
+  # Log only on transition into this state — otherwise it spams the journal
+  # every reconcile cycle while no LAN clients are being served.
+  if (( ${#subnets[@]} == 0 )); then
+    if [[ "${ND_FWD_EMPTY_LOGGED:-}" != "1" ]]; then
+      nd_log "fw: no served subnets; ND_FWD empty (lte='${lte:-none}')"
+      ND_FWD_EMPTY_LOGGED=1
+    fi
+    return 0
+  fi
+  ND_FWD_EMPTY_LOGGED=0
 
   for s in "${subnets[@]}"; do
     # Allow egress to the internet ONLY via the LTE iface (when present).

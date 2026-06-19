@@ -136,7 +136,16 @@ bring_down() { nmcli con down "$1" >/dev/null 2>&1 || true; }
 manage_wifi() {
   local dev now_active
   dev="$(wifi_dev)"
-  [[ -z "$dev" ]] && { log "wifi: no wifi device present"; return; }
+  if [[ -z "$dev" ]]; then
+    # Log only on transition into the no-device state, not every poll cycle —
+    # on hardware with no wifi radio this would otherwise spam the journal.
+    if [[ "$WIFI_DEV_PRESENT" != "0" ]]; then
+      log "wifi: no wifi device present — wifi management idle"
+      WIFI_DEV_PRESENT=0
+    fi
+    return
+  fi
+  WIFI_DEV_PRESENT=1
 
   # Radio off? nothing to do.
   if [[ "$(nmcli -t -f WIFI radio 2>/dev/null)" != "enabled" ]]; then
@@ -282,6 +291,7 @@ trap on_term TERM INT
 
 LAST_PROBE=0
 LAST_ETH_CARRIER=-1   # force a probe on the first cycle if link is already up
+WIFI_DEV_PRESENT=-1   # -1 unknown; log no-wifi-device only on transition
 
 log "nd-net-manager started (poll=${POLL_SECS}s probe=${PROBE_SECS}s cleanup=${CLEANUP_FOREIGN_DHCP} lte_only=${LTE_ONLY})"
 while true; do
