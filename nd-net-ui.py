@@ -212,6 +212,25 @@ def journal_tail(lines=60, tag="nd-net"):
                   timeout=15)
     return out
 
+# Best-effort live IMEI read straight off the stick. The modem exposes its IMEI
+# pre-auth, so this works even before any unlock has run (e.g. no SIM yet). Host
+# comes from the ZTE .env (ZTE_HOST), defaulting to the modem's admin IP.
+def live_imei():
+    host = "192.168.0.1"
+    try:
+        pairs = dict(parse_env(ZTE_ENV_FILE)[0])
+        host = pairs.get("ZTE_HOST", host) or host
+    except Exception:  # noqa: BLE001
+        pass
+    url = (f"http://{host}/goform/goform_get_cmd_process"
+           f"?isTest=false&cmd=imei&_=1")
+    rc, out = run(["curl", "-s", "-m", "4", "--header",
+                   f"Referer: http://{host}/index.html", url], timeout=6)
+    if rc != 0 or not out:
+        return ""
+    m = re.search(r'"imei"\s*:\s*"(\d+)"', out)
+    return m.group(1) if m else ""
+
 # Last modem/SIM state, parsed from the ZTE handler's journal tag (nd-nm-zte-modem).
 def modem_state():
     rc, out = run(["journalctl", "-t", "nd-nm-zte-modem", "-n", "200", "--no-pager",
@@ -219,6 +238,9 @@ def modem_state():
     fields = {}
     patterns = {
         "ZTE_HOST":         re.compile(r"ZTE_HOST=(\S+)"),
+        # IMEI is logged either as "Pre-auth IMEI=<n>" or "IMEI=<n> IMSI=...".
+        "IMEI":             re.compile(r"\bIMEI=(\d+)"),
+        "IMSI":             re.compile(r"\bIMSI=(\d+)"),
         "MODEM_MAIN_STATE": re.compile(r"MODEM_MAIN_STATE:(\S+)"),
         "Login":            re.compile(r"Login (successful|failed[^\n]*)"),
         "SIM":              re.compile(r"SIM (unlocked|unlocking failed)"),
@@ -228,6 +250,13 @@ def modem_state():
             m = pat.search(line)
             if m:
                 fields[name] = m.group(1) if m.lastindex else m.group(0)
+    # No IMEI in the unlock log yet (e.g. unlock never ran)? Read it live so the
+    # stick still shows up in the UI.
+    if not fields.get("IMEI"):
+        imei = live_imei()
+        if imei:
+            fields["IMEI"] = imei
+            fields["IMEI_source"] = "live"
     return fields, out
 
 # --- HTML --------------------------------------------------------------------
@@ -386,9 +415,12 @@ def render_modem(fields):
     if not fields:
         return '<span class="muted">no modem-handler log entries found</span>'
     rows = []
-    for k in ("ZTE_HOST", "Login", "SIM", "MODEM_MAIN_STATE"):
+    for k in ("ZTE_HOST", "IMEI", "IMSI", "Login", "SIM", "MODEM_MAIN_STATE"):
         if k in fields:
-            rows.append(f'<tr><td class="k">{esc(k)}</td><td>{esc(str(fields[k]))}</td></tr>')
+            val = esc(str(fields[k]))
+            if k == "IMEI" and fields.get("IMEI_source") == "live":
+                val += ' <span class="muted">(live read)</span>'
+            rows.append(f'<tr><td class="k">{esc(k)}</td><td>{val}</td></tr>')
     return f'<table class="env"><tbody>{"".join(rows)}</tbody></table>'
 
 def _env_fallback_active():
