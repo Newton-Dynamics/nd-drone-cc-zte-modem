@@ -92,13 +92,23 @@ ND_IPT="${ND_IPT:-iptables}"   # overridable for testing
 
 # The LTE network interface: a USB 'enx*' (or eth1/wwan0) whose USB vendor is
 # ZTE (19d2). Empty when the stick is not present.
+#
+# Note: a USB net iface's /sys/.../device symlink points at the USB *interface*
+# node (e.g. 1-2.2.3:1.0), which has NO idVendor — that lives on the parent USB
+# *device* node (1-2.2.3). So we resolve the device path and walk up parents
+# until we find an idVendor, checking it against ZTE's 19d2.
 nd_lte_iface() {
-  local iface vf
+  local iface dev p
   for iface in eth1 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
-    vf="/sys/class/net/$iface/device/idVendor"
-    if [[ -f "$vf" && "$(cat "$vf" 2>/dev/null)" == "19d2" ]]; then
-      printf '%s\n' "$iface"; return 0
-    fi
+    dev="$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null)" || continue
+    [[ -n "$dev" ]] || continue
+    p="$dev"
+    while [[ -n "$p" && "$p" != "/" && "$p" != "/sys" ]]; do
+      if [[ -f "$p/idVendor" && "$(cat "$p/idVendor" 2>/dev/null)" == "19d2" ]]; then
+        printf '%s\n' "$iface"; return 0
+      fi
+      p="$(dirname "$p")"
+    done
   done
   return 0
 }

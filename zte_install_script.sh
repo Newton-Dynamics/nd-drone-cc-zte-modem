@@ -42,6 +42,26 @@ ok()  { echo -e "${c_green}[OK]${c_reset} $*"; }
 warn(){ echo -e "${c_yellow}[WARN]${c_reset} $*"; }
 err() { echo -e "${c_red}[ERR]${c_reset} $*" >&2; }
 
+# Find the ZTE LTE network interface (vendor 19d2). A USB net iface's
+# /sys/.../device symlink points at the USB *interface* node, which has no
+# idVendor — that lives on a parent USB *device* node — so walk parents up.
+# Echoes the iface name (empty if not present).
+zte_find_iface() {
+    local iface dev p
+    for iface in eth1 usb0 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
+        dev="$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null)" || continue
+        [[ -n "$dev" ]] || continue
+        p="$dev"
+        while [[ -n "$p" && "$p" != "/" && "$p" != "/sys" ]]; do
+            if [[ -f "$p/idVendor" && "$(cat "$p/idVendor" 2>/dev/null)" == "19d2" ]]; then
+                printf '%s\n' "$iface"; return 0
+            fi
+            p="$(dirname "$p")"
+        done
+    done
+    return 0
+}
+
 ### ---------------------------------------------------------------------------
 ### PREFLIGHT CHECK
 ### ---------------------------------------------------------------------------
@@ -98,17 +118,11 @@ preflight_check() {
 
     # interface detection
     msg "Detecting potential modem interfaces…"
-    local found_zte=0
-    for iface in eth1 usb0 wwan0 $(ls /sys/class/net | grep -E '^enx'); do
-        local vendor_file="/sys/class/net/$iface/device/idVendor"
-        if [[ -f "$vendor_file" ]] && [[ "$(cat "$vendor_file")" == "19d2" ]]; then
-            ok "Detected ZTE modem interface: $iface"
-            found_zte=1
-        elif [[ -d "/sys/class/net/$iface" ]]; then
-            warn "Interface $iface exists but is not a ZTE device (vendor: $(cat "$vendor_file" 2>/dev/null || echo unknown))"
-        fi
-    done
-    if [[ $found_zte -eq 0 ]]; then
+    local zte_iface
+    zte_iface="$(zte_find_iface)"
+    if [[ -n "$zte_iface" ]]; then
+        ok "Detected ZTE modem interface: $zte_iface"
+    else
         warn "No ZTE modem interface detected — connect the modem and re-run --dry-run to verify"
     fi
 
@@ -257,14 +271,8 @@ check_status() {
     echo
 
     # --- Identify ZTE (LTE) network interface ---
-    local lte_iface=""
-    for iface in eth1 usb0 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
-        local vendor_file="/sys/class/net/$iface/device/idVendor"
-        if [[ -f "$vendor_file" ]] && [[ "$(cat "$vendor_file")" == "19d2" ]]; then
-            lte_iface="$iface"
-            break
-        fi
-    done
+    local lte_iface
+    lte_iface="$(zte_find_iface)"
 
     # --- Routing table ---
     msg "Default routes (all):"
