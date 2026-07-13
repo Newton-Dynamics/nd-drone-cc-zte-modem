@@ -1,6 +1,11 @@
 #!/bin/bash
 # This file goes to /etc/NetworkManager/dispatcher.d/
-# Purpose: Handle ZTE modem interface events, prefer Wi‑Fi routes, and run modem workflow.
+# Purpose: Handle ZTE modem interface events, prefer LTE routes, and run modem workflow.
+#
+# Deliberately self-contained (does not source lib/nd-common.sh): this runs
+# synchronously inside NetworkManager's dispatcher event path, so a
+# missing/broken shared-lib file must never be able to break interface-up
+# handling.
 
 set -Eeuo pipefail
 
@@ -56,9 +61,7 @@ if [[ "$iface" =~ ^(enx|eth1|usb0) ]] && [[ "$state" =~ ^(pre-up|up)$ ]]; then
 
   log "[$iface] state: $state - lock acquired"
 
-  export ZTE_ENV_FILE="/opt/zte/.env"
-
-  script="/opt/zte/zte_http.sh"
+  script="/opt/nd-uplink/modem/nd-zte-modem.sh"
   if [[ ! -r "$script" ]]; then
     die "Script not readable: $script"
   fi
@@ -99,7 +102,7 @@ if [[ "$iface" =~ ^(enx|eth1|usb0) ]] && [[ "$state" =~ ^(pre-up|up)$ ]]; then
   # Only run the modem workflow when it's meaningful
   if [[ "$state" != "dhcp4-change" ]]; then
     # Intentionally keep sudo + invocation style to avoid behavior change.
-    /usr/bin/sudo -u root -H /bin/bash -lc "/bin/bash '$script' 2>&1" | /usr/bin/logger -t nd_zte &
+    /usr/bin/sudo -u root -H /bin/bash -lc "/bin/bash '$script' 2>&1" | /usr/bin/logger -t nd-zte &
     log "Modem handler started in background (PID $!)"
   else
     log "Skipping modem workflow on state=$state"

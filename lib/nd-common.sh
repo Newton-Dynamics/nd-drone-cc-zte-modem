@@ -1,27 +1,92 @@
 #!/usr/bin/env bash
 #
-# nd-net-lib.sh — shared helpers for nd-net-manager and nd-net-status.
-# Installed to: /opt/nd-net/nd-net-lib.sh  (sourced, not executed directly)
+# nd-common.sh — shared helpers for the nd-uplink / nd-zte-modem stack.
+# Installed to: /opt/nd-uplink/lib/nd-common.sh  (sourced, not executed directly)
 #
-# Purpose: detect (and optionally kill) DHCP/AP daemons that have landed on the
-# interfaces THIS stack manages, while leaving everything else strictly alone —
-# NetworkManager's own shared-mode dnsmasq, the BlueOS Cable Guy dnsmasq on
-# usb0, Docker's NAT, interface IPs/routes, and NM connection profiles.
+# Covers: console output, root/dependency checks, device detection
+# (wifi / onboard-ethernet / LTE), foreign DHCP/AP daemon detection+reap,
+# and the LTE-only egress firewall (tagged chain ND_FWD).
 #
-# Scope is deliberately narrow (user chose "coexist, minimal cleanup"):
-# the ONLY thing we ever kill is a foreign dnsmasq/hostapd bound to a managed
-# interface. We never flush iptables, never touch addresses/routes, never touch
-# a non-managed interface (usb0 can therefore never match).
+# Scope is deliberately narrow (user chose "coexist, minimal cleanup"): the
+# ONLY processes ever killed are a foreign dnsmasq/hostapd bound to an
+# interface THIS stack manages (wifi + onboard ethernet). The LTE stick is a
+# USB client interface that runs no local DHCP/AP daemon, so it is never a
+# managed iface. We never flush iptables, never touch addresses/routes, and
+# never touch a non-managed interface (so BlueOS's usb0 can never match).
 #
 # shellcheck shell=bash
 
-ND_LOGTAG="${ND_LOGTAG:-nd-net}"
+ND_LOGTAG="${ND_LOGTAG:-nd-uplink}"
 
+# --- console output (installer / interactive use) ----------------------------
+if [[ -t 1 ]]; then
+  nd_cG="\033[1;32m"; nd_cR="\033[1;31m"; nd_cY="\033[1;33m"; nd_cB="\033[1;34m"; nd_c0="\033[0m"
+else
+  nd_cG=""; nd_cR=""; nd_cY=""; nd_cB=""; nd_c0=""
+fi
+msg()  { echo -e "${nd_cB}[*]${nd_c0} $*"; }
+ok()   { echo -e "${nd_cG}[OK]${nd_c0} $*"; }
+warn() { echo -e "${nd_cY}[WARN]${nd_c0} $*"; }
+err()  { echo -e "${nd_cR}[ERR]${nd_c0} $*" >&2; }
+
+# --- syslog (daemon / dispatcher use) ----------------------------------------
 nd_log() { /usr/bin/logger -t "$ND_LOGTAG" -- "$*"; }
 
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    err "This action needs root. Re-run with sudo."
+    exit 1
+  fi
+}
+
+# --- dependency check ---------------------------------------------------------
+# nd_check_deps <dry-run|install> <tool> [tool...]
+# Reports missing tools; in "install" mode, attempts apt-get install.
+nd_check_deps() {
+  local mode="$1"; shift
+  local deps=("$@")
+  local missing=()
+  local d
+  msg "Checking required tools…"
+  for d in "${deps[@]}"; do command -v "$d" >/dev/null 2>&1 || missing+=("$d"); done
+  if (( ${#missing[@]} == 0 )); then
+    ok "All required tools present."
+    return 0
+  fi
+  warn "Missing: ${missing[*]}"
+  if [[ "$mode" == "install" ]] && command -v apt-get >/dev/null 2>&1; then
+    msg "Attempting apt-get install…"
+    apt-get update -qq && apt-get install -y "${missing[@]}" || warn "Automatic install failed — install manually."
+  fi
+}
+
+# --- device detection ---------------------------------------------------------
+nd_wifi_dev() {
+  nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}'
+}
+
+# Onboard ethernet = ethernet device named en*/eth* but NOT a USB enx* NIC (ZTE).
+nd_eth_dev() {
+  nmcli -t -f DEVICE,TYPE device 2>/dev/null \
+    | awk -F: '$2=="ethernet" && $1 ~ /^(en|eth)/ && $1 !~ /^enx/ {print $1; exit}'
+}
+
+# The LTE network interface: a USB 'enx*' (or eth1/wwan0) whose USB vendor is
+# ZTE (19d2). Empty when the stick is not present.
+nd_lte_iface() {
+  local iface vf
+  for iface in eth1 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
+    vf="/sys/class/net/$iface/device/idVendor"
+    if [[ -f "$vf" && "$(cat "$vf" 2>/dev/null)" == "19d2" ]]; then
+      printf '%s\n' "$iface"; return 0
+    fi
+  done
+  return 0
+}
+
 # Interfaces we manage: the wifi device (hotspot/client) and the onboard
-# ethernet (DHCP client/server). The LTE stick is a USB 'enx*' *client* — it
-# runs no local DHCP/AP daemon — so it is intentionally NOT a managed iface.
+# ethernet (DHCP client/server). The LTE stick is intentionally excluded (see
+# header note).
 nd_managed_ifaces() {
   nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '
     $2=="wifi" { print $1 }
@@ -67,14 +132,13 @@ nd_foreign_dhcp() {
   done < <(ps -eo pid=,ppid=,comm=,args= 2>/dev/null)
 }
 
-# Kill whatever nd_foreign_dhcp reports. Returns the number of processes killed.
+# Kill whatever nd_foreign_dhcp reports.
 nd_reap_foreign() {
-  local pid iface comm args n=0
+  local pid iface comm args
   while IFS='|' read -r pid iface comm args; do
     [[ -z "$pid" ]] && continue
     nd_log "cleanup: killing foreign $comm pid=$pid on $iface: $args"
     kill "$pid" 2>/dev/null || true
-    n=$((n + 1))
   done < <(nd_foreign_dhcp)
   return 0
 }
@@ -89,19 +153,6 @@ nd_reap_foreign() {
 
 ND_CHAIN="ND_FWD"
 ND_IPT="${ND_IPT:-iptables}"   # overridable for testing
-
-# The LTE network interface: a USB 'enx*' (or eth1/wwan0) whose USB vendor is
-# ZTE (19d2). Empty when the stick is not present.
-nd_lte_iface() {
-  local iface vf
-  for iface in eth1 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
-    vf="/sys/class/net/$iface/device/idVendor"
-    if [[ -f "$vf" && "$(cat "$vf" 2>/dev/null)" == "19d2" ]]; then
-      printf '%s\n' "$iface"; return 0
-    fi
-  done
-  return 0
-}
 
 # /24 subnets we are currently SERVING (NM 'shared' assigns 10.42.x.1/24).
 # Only our managed ifaces are considered, and only when they hold a 10.42.x addr.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# nd-net-manager — single failover daemon for the Jetson.
-# Installed to: /opt/nd-net/nd-net-manager.sh   (run by nd-net-manager.service)
+# nd-uplink-manager — single failover daemon for the Jetson.
+# Installed to: /opt/nd-uplink/net/nd-uplink-manager.sh   (run by nd-uplink-manager.service)
 #
 # Responsibilities (NetworkManager is the engine; this only drives what NM
 # cannot do on its own):
@@ -15,14 +15,14 @@
 #      clients reach the internet ONLY via the LTE stick.
 #   4. Hygiene: reap foreign dnsmasq/hostapd that land on our interfaces.
 #
-# Idempotent and safe to restart at any time. Logs via: journalctl -t nd-net
+# Idempotent and safe to restart at any time. Logs via: journalctl -t nd-uplink
 #
 set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-LOGTAG="nd-net"
+LOGTAG="nd-uplink"
 
-# --- tunables (overridable via /opt/nd-net/.env) -----------------------------
+# --- tunables (overridable via /opt/nd-uplink/.env) -----------------------------
 HOTSPOT_CON="nd-hotspot"            # NM connection id of the onboard AP
 ETH_CLIENT_CON="Wired connection 1" # NM DHCP-client profile (onboard ethernet)
 ETH_SERVER_CON="nd-eth-dhcp-server" # NM DHCP-server (shared) — the default
@@ -33,18 +33,20 @@ WIFI_PROBE=0                        # 0=never probe while hotspot is up (clients
                                     #   scan and switch to a known network if seen
 CLEANUP_FOREIGN_DHCP=1              # reap foreign dnsmasq/hostapd on our ifaces
 LTE_ONLY=1                          # enforce LAN-clients-egress-via-LTE-only
-ENV_FILE="${ND_NET_ENV_FILE:-/opt/nd-net/.env}"
+ENV_FILE="${ND_UPLINK_ENV_FILE:-/opt/nd-uplink/.env}"
 # shellcheck disable=SC1090
 [[ -r "$ENV_FILE" ]] && . "$ENV_FILE"
 
-# Shared helpers (foreign-daemon reaper). Prefer a sibling copy (running from
-# the repo), fall back to the installed location.
+# Shared helpers (device detection + hygiene + firewall). Prefer the repo-
+# relative sibling (../lib/nd-common.sh — works both run-from-repo and
+# installed under /opt/nd-uplink), fall back to the fixed install path.
 ND_LOGTAG="$LOGTAG"
-_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/nd-net-lib.sh"
-[[ -r "$_LIB" ]] || _LIB="/opt/nd-net/nd-net-lib.sh"
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+_LIB="$_SELF_DIR/../lib/nd-common.sh"
+[[ -r "$_LIB" ]] || _LIB="/opt/nd-uplink/lib/nd-common.sh"
 # shellcheck source=/dev/null
 if [[ -r "$_LIB" ]]; then . "$_LIB"; else
-  /usr/bin/logger -t "$LOGTAG" "WARN: nd-net-lib.sh not found ($_LIB) — hygiene cleanup disabled"
+  /usr/bin/logger -t "$LOGTAG" "WARN: nd-common.sh not found ($_LIB) — hygiene cleanup disabled"
   CLEANUP_FOREIGN_DHCP=0
 fi
 
@@ -60,18 +62,13 @@ case "${1:-}" in
 esac
 
 # --- single-instance lock ----------------------------------------------------
-exec 9>/run/nd-net-manager.lock
+exec 9>/run/nd-uplink-manager.lock
 if ! flock -n 9; then
   log "another instance is already running — exiting"
   exit 0
 fi
 
 # --- helpers -----------------------------------------------------------------
-
-wifi_dev() {
-  nmcli -t -f DEVICE,TYPE device 2>/dev/null \
-    | awk -F: '$2=="wifi"{print $1; exit}'
-}
 
 # SSIDs of all saved wifi *client* profiles (mode != ap), excluding the hotspot.
 # Printed one per line. Recomputed each cycle so `nmcli` edits are picked up.
@@ -135,7 +132,7 @@ bring_down() { nmcli con down "$1" >/dev/null 2>&1 || true; }
 
 manage_wifi() {
   local dev now_active
-  dev="$(wifi_dev)"
+  dev="$(nd_wifi_dev)"
   [[ -z "$dev" ]] && { log "wifi: no wifi device present"; return; }
 
   # Radio off? nothing to do.
@@ -214,11 +211,6 @@ manage_wifi() {
 # carrier down->up edge (link plugged in) — never on a periodic timer, so a
 # stable served LAN is never disrupted.
 
-eth_dev() {
-  nmcli -t -f DEVICE,TYPE device 2>/dev/null \
-    | awk -F: '$2=="ethernet" && $1 ~ /^(en|eth)/ && $1 !~ /^enx/ {print $1; exit}'
-}
-
 eth_has_ip() {  # true if the device currently holds any IPv4 address
   local dev="$1"
   [[ -n "$(ip -4 -o addr show dev "$dev" 2>/dev/null)" ]]
@@ -226,7 +218,7 @@ eth_has_ip() {  # true if the device currently holds any IPv4 address
 
 manage_eth() {
   local dev carrier active
-  dev="$(eth_dev)"
+  dev="$(nd_eth_dev)"
   [[ -z "$dev" ]] && return
 
   carrier=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo 0)
@@ -272,7 +264,7 @@ manage_fw() {
 
 # --- shutdown ----------------------------------------------------------------
 on_term() {
-  log "nd-net-manager stopping — clearing LTE-only firewall"
+  log "nd-uplink-manager stopping — clearing LTE-only firewall"
   nd_fw_clear 2>/dev/null || true
   exit 0
 }
@@ -283,7 +275,7 @@ trap on_term TERM INT
 LAST_PROBE=0
 LAST_ETH_CARRIER=-1   # force a probe on the first cycle if link is already up
 
-log "nd-net-manager started (poll=${POLL_SECS}s probe=${PROBE_SECS}s cleanup=${CLEANUP_FOREIGN_DHCP} lte_only=${LTE_ONLY})"
+log "nd-uplink-manager started (poll=${POLL_SECS}s probe=${PROBE_SECS}s cleanup=${CLEANUP_FOREIGN_DHCP} lte_only=${LTE_ONLY})"
 while true; do
   [[ "$CLEANUP_FOREIGN_DHCP" == "1" ]] && { nd_reap_foreign || log "cleanup: cycle error (continuing)"; }
   manage_wifi || log "wifi: cycle error (continuing)"

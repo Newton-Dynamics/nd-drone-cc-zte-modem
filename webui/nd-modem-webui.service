@@ -1,0 +1,17 @@
+[Unit]
+Description=Newton nd-uplink modem/SIM config UI (independent of NetworkManager/nd-uplink-manager)
+Documentation=file:/opt/nd-uplink/webui/nd-modem-webui.py
+After=network.target
+# Deliberately no Requires/Wants on NetworkManager or nd-uplink-manager: this
+# must come up and stay reachable even if the rest of the stack is broken,
+# so it can be used to fix it (add/select a modem, re-run the unlock, etc.).
+
+[Service]
+Type=simple
+SyslogIdentifier=nd-modem-webui
+ExecStart=/usr/bin/python3 /opt/nd-uplink/webui/nd-modem-webui.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
