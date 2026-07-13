@@ -73,11 +73,29 @@ nd_eth_dev() {
 
 # The LTE network interface: a USB 'enx*' (or eth1/wwan0) whose USB vendor is
 # ZTE (19d2). Empty when the stick is not present.
+# USB vendor ID for a network interface's underlying device. Plain
+# USB-ethernet adapters expose idVendor directly under .../device/; composite
+# (RNDIS-style) devices — like the ZTE MF79U — expose it one level up, on the
+# parent USB device node, since .../device/ points at the USB *interface*
+# (e.g. 1-2.2:1.0), not the USB *device* (1-2.2) that idVendor lives on.
+# Walk up a few levels to find it either way.
+nd_usb_vendor_id() {
+  local dev_path="/sys/class/net/$1/device" up=""
+  local i
+  for i in 0 1 2 3; do
+    if [[ -f "$dev_path$up/idVendor" ]]; then
+      cat "$dev_path$up/idVendor" 2>/dev/null
+      return 0
+    fi
+    up="$up/.."
+  done
+  return 1
+}
+
 nd_lte_iface() {
-  local iface vf
+  local iface
   for iface in eth1 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
-    vf="/sys/class/net/$iface/device/idVendor"
-    if [[ -f "$vf" && "$(cat "$vf" 2>/dev/null)" == "19d2" ]]; then
+    if [[ "$(nd_usb_vendor_id "$iface")" == "19d2" ]]; then
       printf '%s\n' "$iface"; return 0
     fi
   done

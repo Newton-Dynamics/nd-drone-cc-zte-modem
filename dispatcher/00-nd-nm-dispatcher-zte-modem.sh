@@ -85,7 +85,16 @@ if [[ "$iface" =~ ^(enx|eth1|usb0) ]] && [[ "$state" =~ ^(pre-up|up)$ ]]; then
   fi
 
   if [[ -n "$WIFI_CON" ]]; then
-    nmcli con modify "$WIFI_CON" ipv4.route-metric 600 >/dev/null 2>&1 || log "WARN: failed to set metric on Wi‑Fi connection: $WIFI_CON"
+    # dns-priority: deprioritized (higher number = tried later) — WiFi is a
+    # fallback uplink, so its DNS server should never be preferred over a
+    # better connection's, even though it's still available if WiFi is the
+    # only interface up.
+    nmcli con modify "$WIFI_CON" ipv4.route-metric 600 ipv4.dns-priority 600 >/dev/null 2>&1 \
+      || log "WARN: failed to set metric/dns-priority on Wi‑Fi connection: $WIFI_CON"
+    # con modify only updates the saved profile; reapply pushes it onto the
+    # already-active device so an existing route/DNS registration doesn't
+    # keep using the old values until the next full reconnect.
+    nmcli device reapply "$WIFI_IF" >/dev/null 2>&1 || log "WARN: failed to reapply Wi‑Fi device: $WIFI_IF"
   else
     log "INFO: No Wi‑Fi connection found to prioritize"
   fi
@@ -93,6 +102,17 @@ if [[ "$iface" =~ ^(enx|eth1|usb0) ]] && [[ "$state" =~ ^(pre-up|up)$ ]]; then
   if [[ -n "$ZTE_CON" ]]; then
     nmcli con modify "$ZTE_CON" ipv4.route-metric 50 >/dev/null 2>&1 || log "WARN: failed to set IPv4 metric on ZTE connection: $ZTE_CON"
     nmcli con modify "$ZTE_CON" ipv6.route-metric 50 >/dev/null 2>&1 || log "WARN: failed to set IPv6 metric on ZTE connection: $ZTE_CON"
+    # Deprioritize this connection's DNS too (same reasoning as WiFi above):
+    # while the SIM is locked, this interface only reaches the modem's own
+    # local/fake resolver, which must never win over a real connection's DNS
+    # just because it's registered as a default-route scope. Once the modem
+    # is genuinely providing data, its route-metric (50) still wins for the
+    # actual data path regardless of DNS priority — DNS queries go to
+    # whichever resolver is reachable, independent of which interface
+    # carries the return internet traffic.
+    nmcli con modify "$ZTE_CON" ipv4.dns-priority 600 >/dev/null 2>&1 \
+      || log "WARN: failed to set dns-priority on ZTE connection: $ZTE_CON"
+    nmcli device reapply "$ZTE_IF" >/dev/null 2>&1 || log "WARN: failed to reapply ZTE device: $ZTE_IF"
   else
     log "INFO: No ZTE connection found for interface: $ZTE_IF"
   fi
