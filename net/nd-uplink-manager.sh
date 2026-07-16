@@ -240,11 +240,22 @@ eth_has_real_lease() {
   ip -4 route show default dev "$dev" 2>/dev/null | grep -q .
 }
 
-# Any active downstream DHCP lease currently handed out by our eth server?
+# Any downstream DHCP lease currently handed out by our eth server that has
+# NOT yet expired? dnsmasq's leases file (<expiry-epoch> <mac> <ip> <host>
+# <client-id>, one per line) keeps expired entries around until it happens to
+# rewrite the file, so a stale line from a client that's long gone must not
+# be read as "someone is still attached" (that would block every future
+# re-probe indefinitely).
 eth_has_served_clients() {
-  local dev="$1" leases_file
+  local dev="$1" leases_file now expiry
   leases_file="/var/lib/NetworkManager/dnsmasq-${dev}.leases"
-  [[ -s "$leases_file" ]]
+  [[ -s "$leases_file" ]] || return 1
+  now=$(date +%s)
+  while read -r expiry _; do
+    [[ "$expiry" =~ ^[0-9]+$ ]] || continue
+    (( expiry > now )) && return 0
+  done < "$leases_file"
+  return 1
 }
 
 # Bring up the DHCP-client profile and wait (bounded) for a REAL lease, not
