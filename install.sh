@@ -54,6 +54,7 @@ WEBUI_SERVICE_DST="/etc/systemd/system/nd-modem-webui.service"
 STATUS_LINK="/usr/local/bin/nd-uplink-status"
 ACTIVATE_LINK="/usr/local/bin/nd-zte-activate"
 WEBUI_PORT=8088
+AVAHI_CONF="/etc/avahi/avahi-daemon.conf"
 
 HOTSPOT_CON="nd-hotspot"
 ETH_CLIENT_CON="Wired connection 1"
@@ -147,6 +148,12 @@ preflight() {
     fi
   done
 
+  if [[ -f "$AVAHI_CONF" ]] && command -v avahi-daemon >/dev/null 2>&1; then
+    ok "avahi-daemon config found — would scope allow-interfaces to managed iface(s) (${eth:-none}${wifi:+,$wifi}), avoiding Docker-bridge .local addresses"
+  else
+    warn "avahi-daemon not found — mDNS interface scoping will be skipped"
+  fi
+
   msg "Hygiene preview (report only — nothing is killed in dry-run):"
   msg "Managed interfaces: $(nd_managed_ifaces | paste -sd' ' -)"
   local foreign; foreign="$(nd_foreign_dhcp 2>/dev/null || true)"
@@ -235,6 +242,38 @@ tune_eth_client() {
   fi
 }
 
+### --- avahi (mDNS) interface scoping ------------------------------------------
+# By default avahi-daemon publishes .local addresses from every interface it
+# sees — including Docker's docker0/br-*/veth* bridges. On a box running
+# Docker (BlueOS), that means <hostname>.local can resolve to a
+# container-only bridge address (e.g. 172.17.0.1) instead of the real LAN
+# address, so `ping` by IP works but `ssh <hostname>.local` silently connects
+# nowhere reachable. Scope avahi to just the interfaces this stack manages
+# (onboard ethernet + WiFi, if present) so it only ever publishes a real,
+# reachable LAN address.
+configure_avahi() {
+  local eth="$1" wifi="$2" ifaces
+  [[ -f "$AVAHI_CONF" ]] || { warn "avahi-daemon.conf not found — skipping mDNS interface scoping"; return 0; }
+  command -v avahi-daemon >/dev/null 2>&1 || { warn "avahi-daemon not installed — skipping mDNS interface scoping"; return 0; }
+
+  ifaces="$eth"
+  [[ -n "$wifi" ]] && ifaces="${ifaces:+$ifaces,}$wifi"
+  [[ -n "$ifaces" ]] || { warn "No managed interface to scope avahi to — skipping"; return 0; }
+
+  msg "Scoping avahi (mDNS) to managed interface(s): $ifaces (avoids publishing Docker bridge addresses)…"
+  cp "$AVAHI_CONF" "${AVAHI_CONF}.bak-nd-uplink" 2>/dev/null || true
+  if grep -q '^allow-interfaces=' "$AVAHI_CONF"; then
+    sed -i "s|^allow-interfaces=.*|allow-interfaces=${ifaces}|" "$AVAHI_CONF"
+  elif grep -q '^#allow-interfaces=' "$AVAHI_CONF"; then
+    sed -i "s|^#allow-interfaces=.*|allow-interfaces=${ifaces}|" "$AVAHI_CONF"
+  else
+    sed -i "/^\[server\]/a allow-interfaces=${ifaces}" "$AVAHI_CONF"
+  fi
+  systemctl restart avahi-daemon 2>/dev/null \
+    && ok "avahi-daemon restarted, now scoped to: $ifaces" \
+    || warn "Could not restart avahi-daemon — scoping applied to $AVAHI_CONF but not yet active"
+}
+
 ### --- file deployment ---------------------------------------------------------
 deploy_files() {
   msg "Installing files under $ND_DIR…"
@@ -310,6 +349,11 @@ perform_install() {
   if [[ -n "$ETH_DEV" ]]; then
     create_eth_server "$ETH_DEV"
     tune_eth_client "$ETH_DEV"
+  fi
+
+  # --- avahi mDNS scoping (skip if neither managed iface is present) ---
+  if [[ -n "$ETH_DEV" || -n "$WIFI_DEV" ]]; then
+    configure_avahi "$ETH_DEV" "$WIFI_DEV"
   fi
 
   # --- files + dispatcher + service ---
@@ -417,6 +461,17 @@ verify() {
     warn "ND_FWD chain not (yet) installed — check 'journalctl -t nd-uplink'"
   fi
 
+  if [[ -f "$AVAHI_CONF" ]] && command -v avahi-daemon >/dev/null 2>&1; then
+    if grep -q '^allow-interfaces=' "$AVAHI_CONF"; then
+      ok "avahi scoped: $(grep '^allow-interfaces=' "$AVAHI_CONF")"
+    else
+      warn "avahi-daemon.conf has no allow-interfaces set — mDNS may publish Docker-bridge addresses"
+    fi
+    systemctl is-active --quiet avahi-daemon \
+      && ok "avahi-daemon is active" \
+      || warn "avahi-daemon is not active"
+  fi
+
   if (( fail )); then
     warn "Verification found issues — see above. Installation is not fully clean."
   else
@@ -477,6 +532,14 @@ print_instructions() {
   echo "  • BlueOS Cable Guy (usb0), Docker NAT, and unrelated NM profiles are untouched."
   echo "  • IMPORTANT: do NOT configure Cable Guy to manage these interfaces — leave"
   echo "    them unmanaged in BlueOS, or it will fight nd-uplink-manager."
+  echo
+  if [[ -f "$AVAHI_CONF" ]] && command -v avahi-daemon >/dev/null 2>&1; then
+    msg "mDNS (.local) note:"
+    echo "  • avahi-daemon is scoped to this stack's managed interface(s) only, so"
+    echo "    <hostname>.local resolves to the real LAN address instead of a Docker"
+    echo "    bridge address (docker0/br-*)."
+    echo "  • Backup of the previous config: ${AVAHI_CONF}.bak-nd-uplink"
+  fi
 }
 
 ### --- status ---------------------------------------------------------------
@@ -505,6 +568,8 @@ perform_uninstall() {
   warn "Left untouched (remove manually if desired):"
   echo "  • NM connection profiles: $HOTSPOT_CON, $ETH_SERVER_CON, $ETH_CLIENT_CON"
   echo "    (nmcli con delete <name>)"
+  echo "  • avahi-daemon interface scoping ($AVAHI_CONF) — restore from"
+  echo "    ${AVAHI_CONF}.bak-nd-uplink if you want the original config back"
 }
 
 ### --- main -----------------------------------------------------------------

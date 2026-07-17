@@ -8,9 +8,13 @@
 #   1. WiFi: join a known network when in range, otherwise run the onboard
 #      hotspot (nd-hotspot). Keep probing so we switch back to a known SSID
 #      when it reappears.
-#   2. Ethernet: SERVE the LAN by default (nd-eth-dhcp-server, DHCP+NAT). On a
-#      link-up edge, probe once for an upstream DHCP server and only then step
-#      back to DHCP-client mode (Wired connection 1).
+#   2. Ethernet: prefer DHCP-CLIENT mode (Wired connection 1) whenever an
+#      upstream DHCP server answers; fall back to SERVING the LAN
+#      (nd-eth-dhcp-server, DHCP+NAT) otherwise. Probed on every link-up edge
+#      and periodically re-probed while serving (only when no downstream
+#      client is leased, so a field deployment already in use is never
+#      disrupted) — so a slow-to-answer office DHCP server still wins without
+#      requiring a physical replug.
 #   3. LTE-only egress: keep the tagged ND_FWD firewall chain in sync so LAN
 #      clients reach the internet ONLY via the LTE stick.
 #   4. Hygiene: reap foreign dnsmasq/hostapd that land on our interfaces.
@@ -28,6 +32,9 @@ ETH_CLIENT_CON="Wired connection 1" # NM DHCP-client profile (onboard ethernet)
 ETH_SERVER_CON="nd-eth-dhcp-server" # NM DHCP-server (shared) — the default
 POLL_SECS=15                        # main loop cadence
 PROBE_SECS=90                       # min seconds between wifi probes (when enabled)
+ETH_LEASE_WAIT_SECS=10               # max secs to wait for a real lease after bring-up (> NM's own ipv4.dhcp-timeout, set to 8s in install.sh, so NM's timeout fires first)
+ETH_PROBE_RETRIES=2                  # extra probe attempts before falling back to serving
+ETH_REPROBE_SECS=300                 # while serving with no leased clients, re-probe this often
 WIFI_PROBE=0                        # 0=never probe while hotspot is up (clients
                                     #   on the AP stay connected); 1=periodically
                                     #   scan and switch to a known network if seen
@@ -204,16 +211,78 @@ manage_wifi() {
   bring_up "$HOTSPOT_CON" || log "wifi: ERROR starting hotspot"
 }
 
-# --- Ethernet: SERVE by default, detect upstream on link-up ------------------
-# The Jetson is the gateway for downstream devices (DHCP server + NAT to LTE).
-# We only step back to DHCP-client when another DHCP server is detected on the
-# segment. Detection is done by an actual short client probe, triggered on a
-# carrier down->up edge (link plugged in) — never on a periodic timer, so a
-# stable served LAN is never disrupted.
+# --- Ethernet: prefer DHCP-client, fall back to serving ----------------------
+# The Jetson prefers to be a DHCP CLIENT whenever a real upstream DHCP server
+# answers (office/company use); otherwise it SERVES the LAN itself (DHCP+NAT
+# to LTE), so field devices get plug-and-play with no upstream present.
+#
+# "Upstream present" is verified by an actual lease (IPv4 address + default
+# route via the device), not just nmcli reporting the profile active — `nmcli
+# con up` can return success before DHCP has actually completed. The probe is
+# retried a few times (ETH_PROBE_RETRIES) before giving up and serving, so a
+# merely slow office DHCP server isn't misread as "absent".
+#
+# Triggered on every carrier down->up edge (cable plugged in / replugged),
+# and periodically re-tried while serving (ETH_REPROBE_SECS) — but ONLY when
+# no downstream client currently holds a lease, so a field deployment already
+# in active use is never disrupted just because a timer fired.
 
 eth_has_ip() {  # true if the device currently holds any IPv4 address
   local dev="$1"
   [[ -n "$(ip -4 -o addr show dev "$dev" 2>/dev/null)" ]]
+}
+
+# True if the device holds an IPv4 address AND a default route via it — i.e.
+# an actually-usable upstream lease, not just "NM activated the profile".
+eth_has_real_lease() {
+  local dev="$1"
+  eth_has_ip "$dev" || return 1
+  ip -4 route show default dev "$dev" 2>/dev/null | grep -q .
+}
+
+# Any downstream DHCP lease currently handed out by our eth server that has
+# NOT yet expired? dnsmasq's leases file (<expiry-epoch> <mac> <ip> <host>
+# <client-id>, one per line) keeps expired entries around until it happens to
+# rewrite the file, so a stale line from a client that's long gone must not
+# be read as "someone is still attached" (that would block every future
+# re-probe indefinitely).
+eth_has_served_clients() {
+  local dev="$1" leases_file now expiry
+  leases_file="/var/lib/NetworkManager/dnsmasq-${dev}.leases"
+  [[ -s "$leases_file" ]] || return 1
+  now=$(date +%s)
+  while read -r expiry _; do
+    [[ "$expiry" =~ ^[0-9]+$ ]] || continue
+    (( expiry > now )) && return 0
+  done < "$leases_file"
+  return 1
+}
+
+# Bring up the DHCP-client profile and wait (bounded) for a REAL lease, not
+# just profile activation. Returns 0 only once IP+default-route are present.
+eth_try_client() {
+  local dev="$1" waited=0
+  bring_up "$ETH_CLIENT_CON" || return 1
+  while (( waited < ETH_LEASE_WAIT_SECS )); do
+    eth_has_real_lease "$dev" && return 0
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  eth_has_real_lease "$dev"
+}
+
+# Probe for upstream DHCP with a few retries before the caller falls back to
+# serving. Leaves the client connection up on success; caller handles failure.
+eth_probe_upstream() {
+  local dev="$1" attempt
+  for (( attempt = 1; attempt <= 1 + ETH_PROBE_RETRIES; attempt++ )); do
+    log "eth: probing for an upstream DHCP server on $dev (attempt $attempt/$((1 + ETH_PROBE_RETRIES)))"
+    if eth_try_client "$dev"; then
+      return 0
+    fi
+    bring_down "$ETH_CLIENT_CON"
+  done
+  return 1
 }
 
 manage_eth() {
@@ -226,17 +295,18 @@ manage_eth() {
   # Carrier down: nothing to serve; remember state and bail.
   if [[ "$carrier" != "1" ]]; then
     LAST_ETH_CARRIER="$carrier"
+    LAST_ETH_REPROBE=0
     return
   fi
 
-  # Link-up edge (incl. first cycle): probe ONCE for an upstream DHCP server.
+  # Link-up edge (incl. first cycle): probe for an upstream DHCP server.
   if [[ "$carrier" == "1" && "$LAST_ETH_CARRIER" != "1" ]]; then
     LAST_ETH_CARRIER="$carrier"
-    log "eth: link up on $dev — probing for an upstream DHCP server"
-    if bring_up "$ETH_CLIENT_CON"; then
-      log "eth: upstream DHCP present — running as client on $dev"
+    LAST_ETH_REPROBE=$(date +%s)
+    if eth_probe_upstream "$dev"; then
+      log "eth: upstream DHCP present — running as client on $dev (staying this way while the lease holds)"
     else
-      log "eth: no upstream DHCP — serving DHCP + NAT to LTE on $dev"
+      log "eth: no upstream DHCP after $((1 + ETH_PROBE_RETRIES)) attempts — serving DHCP + NAT to LTE on $dev"
       bring_up "$ETH_SERVER_CON" || log "eth: ERROR starting DHCP server"
     fi
     return
@@ -248,8 +318,26 @@ manage_eth() {
             | awk -F: -v d="$dev" '$2==d {print $1; exit}')"
   if [[ "$active" == "$ETH_CLIENT_CON" ]]; then
     # In client mode: if the lease/upstream vanished, revert to serving.
-    eth_has_ip "$dev" || { log "eth: client lease lost — reverting to DHCP server"; bring_up "$ETH_SERVER_CON" || true; }
-  elif [[ "$active" != "$ETH_SERVER_CON" ]]; then
+    eth_has_real_lease "$dev" || { log "eth: client lease lost — reverting to DHCP server"; bring_up "$ETH_SERVER_CON" || true; }
+  elif [[ "$active" == "$ETH_SERVER_CON" ]]; then
+    # Serving: periodically re-check for upstream DHCP, but never while a
+    # field device is actively leased from us (would yank their connection).
+    if (( $(date +%s) - LAST_ETH_REPROBE >= ETH_REPROBE_SECS )); then
+      LAST_ETH_REPROBE=$(date +%s)
+      if eth_has_served_clients "$dev"; then
+        log "eth: serving with active client leases on $dev — skipping upstream re-probe"
+      else
+        log "eth: periodic re-probe for upstream DHCP on $dev (no served clients attached)"
+        bring_down "$ETH_SERVER_CON"
+        if eth_probe_upstream "$dev"; then
+          log "eth: upstream DHCP now present — switching to client on $dev"
+        else
+          log "eth: still no upstream DHCP — resuming DHCP server on $dev"
+          bring_up "$ETH_SERVER_CON" || log "eth: ERROR restarting DHCP server"
+        fi
+      fi
+    fi
+  else
     # Neither of our profiles is up — assert the server default.
     log "eth: asserting DHCP-server default on $dev"
     bring_up "$ETH_SERVER_CON" || true
@@ -274,8 +362,9 @@ trap on_term TERM INT
 
 LAST_PROBE=0
 LAST_ETH_CARRIER=-1   # force a probe on the first cycle if link is already up
+LAST_ETH_REPROBE=0    # last time we (re-)probed eth for upstream DHCP
 
-log "nd-uplink-manager started (poll=${POLL_SECS}s probe=${PROBE_SECS}s cleanup=${CLEANUP_FOREIGN_DHCP} lte_only=${LTE_ONLY})"
+log "nd-uplink-manager started (poll=${POLL_SECS}s probe=${PROBE_SECS}s eth_reprobe=${ETH_REPROBE_SECS}s cleanup=${CLEANUP_FOREIGN_DHCP} lte_only=${LTE_ONLY})"
 while true; do
   [[ "$CLEANUP_FOREIGN_DHCP" == "1" ]] && { nd_reap_foreign || log "cleanup: cycle error (continuing)"; }
   manage_wifi || log "wifi: cycle error (continuing)"
