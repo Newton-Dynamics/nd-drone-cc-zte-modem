@@ -44,7 +44,7 @@ MODEM_SCRIPT = os.environ.get("ND_MODEM_SCRIPT", os.path.join(MODEM_DIR, "nd-zte
 # arbitrary journalctl unit.
 SERVICE_LOG_UNITS = ("nd-uplink-manager.service", "nd-modem-webui.service")
 
-PORT = int(os.environ.get("ND_WEBUI_PORT", "8088"))
+PORT = int(os.environ.get("ND_WEBUI_PORT", "7077"))
 
 
 # --- tiny JSON "database" helpers, flock-guarded like the bash side ---------
