@@ -62,6 +62,13 @@ ACTIVE_DB="${ND_ACTIVE_DB:-$SCRIPT_DIR/active.json}"
 DB_LOCK="${ND_DB_LOCK:-$SCRIPT_DIR/db.lock}"
 MODEM_LOCK="${ND_MODEM_LOCK:-$SCRIPT_DIR/modem.lock}"
 
+# Best-effort shared helpers — used only for the multi-modem advisory below.
+# Sourcing must never be fatal: this script has to keep working (unlock the one
+# modem that IS plugged in) even if the lib is missing/unreadable.
+_ND_LIB="${ND_COMMON_LIB:-$SCRIPT_DIR/../lib/nd-common.sh}"
+# shellcheck source=/dev/null
+[[ -r "$_ND_LIB" ]] && . "$_ND_LIB" 2>/dev/null || true
+
 log() { logger -t "$LOGTAG" -- "$*"; }
 
 # Serialize ALL talk to the modem (default flow, --test-login, --test-pin)
@@ -144,7 +151,7 @@ resolve_modem() {
       log "Identified modem by IMEI $live_imei (pre-auth probe)."
       return 0
     fi
-    log "Unknown modem (IMEI $live_imei) — not registered. Add it via the nd-uplink config UI (port 8088)."
+    log "Unknown modem (IMEI $live_imei) — not registered. Add it via the nd-uplink config UI (port 7077)."
     return 1
   fi
 
@@ -172,7 +179,7 @@ resolve_sim() {
       log "Identified SIM by IMSI $live_imsi."
       return 0
     fi
-    log "Unknown SIM (IMSI $live_imsi) — not registered. Add it via the nd-uplink config UI (port 8088). Skipping ENTER_PIN."
+    log "Unknown SIM (IMSI $live_imsi) — not registered. Add it via the nd-uplink config UI (port 7077). Skipping ENTER_PIN."
     return 1
   fi
 
@@ -312,6 +319,20 @@ for f in "$MODEMS_DB" "$SIMS_DB"; do
     exit 1
   fi
 done
+
+# Multi-modem advisory (non-fatal). Every call below targets a single fixed
+# address (ZTE_HOST): all MF79U units default to that same 192.168.0.1, so two
+# attached at once collide on 192.168.0.0/24 and which one answers is not
+# deterministic. The flow still self-identifies by the live IMEI and re-checks
+# it post-login before touching the SIM (so a wrong-PIN-to-wrong-SIM stays
+# guarded), but routing/firewall/telemetry are unreliable in this state — make
+# it loud in the log so the ambiguity is visible.
+if declare -f nd_lte_modem_count >/dev/null 2>&1; then
+  _nmodems="$(nd_lte_modem_count 2>/dev/null || echo 0)"
+  if [[ "$_nmodems" =~ ^[0-9]+$ ]] && (( _nmodems > 1 )); then
+    log "WARNING: $_nmodems ZTE modems attached — they share $ZTE_HOST and cannot be told apart. Proceeding by live-IMEI identification only; keep only one plugged in for reliable operation."
+  fi
+fi
 
 # Step 1+2: identify the connected modem BEFORE attempting any login
 LIVE_IMEI=$(fetch_unauth imei | grep -oP '(?<="imei":")[^"]+' || true)

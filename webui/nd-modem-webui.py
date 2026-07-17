@@ -409,6 +409,7 @@ INDEX_HTML = r"""<!doctype html>
   button { cursor: pointer; }
   button.danger { color: #cf222e; }
   .muted { color: #8888; font-size: .85rem; }
+  .banner { background: #cf222e; color: #fff; padding: .6rem .8rem; border-radius: .4rem; margin: 1rem 0; font-size: .9rem; }
   #unlockLog, #serviceLog { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .8rem; max-height: 12rem; overflow: auto; background: #8881; padding: .5rem; border-radius: .3rem; color: #000; }
   .spinner { display: inline-block; width: 1rem; height: 1rem; border: 2px solid #8886; border-top-color: #666; border-radius: 50%; animation: nd-spin .8s linear infinite; vertical-align: -2px; margin-right: .4rem; }
   @keyframes nd-spin { to { transform: rotate(360deg); } }
@@ -420,6 +421,8 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <h1>nd-uplink config</h1>
 <p class="muted">Modem/SIM lookup tables and uplink status for this drone's ZTE MF79U + NetworkManager stack.</p>
+
+<div id="modemWarning" class="banner" style="display:none"></div>
 
 <h2>Uplink status</h2>
 <table id="statusTable"><tbody><tr><td colspan="2"><span class="spinner"></span>Loading…</td></tr></tbody></table>
@@ -500,6 +503,14 @@ async function refreshStatus() {
   const tbody = document.querySelector('#statusTable tbody');
   try {
     const s = await api('/api/status');
+    const warn = document.getElementById('modemWarning');
+    const mc = s.lte && s.lte.modem_count;
+    if (mc && mc > 1) {
+      warn.style.display = 'block';
+      warn.textContent = `⚠ ${mc} modems detected — every ZTE stick shares 192.168.0.1, so they collide on the same subnet and can't be reliably managed (routing, firewall and modem reads are all ambiguous). Unplug all but one.`;
+    } else {
+      warn.style.display = 'none';
+    }
     const type = uplinkType(s);
     const routeValue = s.uplink.iface ? (s.uplink.iface + (type ? ` (${type})` : '')) : 'none';
     const rows = [

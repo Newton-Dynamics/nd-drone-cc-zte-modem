@@ -66,6 +66,9 @@ if command -v lsusb >/dev/null 2>&1 && lsusb 2>/dev/null | grep -qi "19d2"; then
   lte_usb_id=$(lsusb | grep -i 19d2 | head -1 | sed 's/^.*ID //')
 fi
 lte_iface=$(declare -f nd_lte_iface >/dev/null 2>&1 && nd_lte_iface || true)
+# Distinct physical modems attached — >1 means they collide on 192.168.0.1.
+lte_modem_count=""
+declare -f nd_lte_modem_count >/dev/null 2>&1 && lte_modem_count=$(nd_lte_modem_count 2>/dev/null || echo "")
 lte_operstate=""
 [[ -n "$lte_iface" ]] && lte_operstate=$(cat "/sys/class/net/$lte_iface/operstate" 2>/dev/null || echo unknown)
 
@@ -225,6 +228,7 @@ if (( JSON_MODE )); then
   jq -n \
     --argjson lte_usb_present "$lte_usb_present" \
     --arg lte_usb_id "$lte_usb_id" \
+    --arg lte_modem_count "$lte_modem_count" \
     --arg lte_iface "$lte_iface" \
     --arg lte_operstate "$lte_operstate" \
     --argjson lte_active_uplink "$lte_is_active_uplink" \
@@ -256,6 +260,7 @@ if (( JSON_MODE )); then
       lte: {
         usb_present: ($lte_usb_present == 1),
         usb_id: ($lte_usb_id | if length > 0 then . else null end),
+        modem_count: ($lte_modem_count | if length > 0 then tonumber else null end),
         iface: ($lte_iface | if length > 0 then . else null end),
         operstate: ($lte_operstate | if length > 0 then . else null end),
         active_uplink: ($lte_active_uplink == 1),
@@ -304,6 +309,9 @@ if (( lte_usb_present )); then
   line_ok "USB modem present ($lte_usb_id)"
 else
   line_no "USB modem not detected (vendor 19d2)"
+fi
+if [[ "$lte_modem_count" =~ ^[0-9]+$ ]] && (( lte_modem_count > 1 )); then
+  line_no "MULTIPLE modems attached ($lte_modem_count) — all ZTE sticks share 192.168.0.1 and cannot be told apart; keep only one plugged in (routing, firewall and modem reads are unreliable otherwise)."
 fi
 if [[ -n "$lte_iface" ]]; then
   line_ok "Interface $lte_iface is ${lte_operstate:-unknown}"

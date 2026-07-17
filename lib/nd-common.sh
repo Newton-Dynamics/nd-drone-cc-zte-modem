@@ -79,27 +79,62 @@ nd_eth_dev() {
 # parent USB device node, since .../device/ points at the USB *interface*
 # (e.g. 1-2.2:1.0), not the USB *device* (1-2.2) that idVendor lives on.
 # Walk up a few levels to find it either way.
-nd_usb_vendor_id() {
-  local dev_path="/sys/class/net/$1/device" up=""
-  local i
+# Resolve the sysfs directory that carries idVendor for a net iface's USB
+# device — i.e. the USB *device* node (e.g. .../1-2.2), not the USB *interface*
+# node (.../1-2.2:1.0). Walk up a few levels and print the canonical path.
+# Empty + non-zero return when the iface isn't USB-backed.
+nd_usb_device_path() {
+  local dev_path="/sys/class/net/$1/device" up="" i
   for i in 0 1 2 3; do
     if [[ -f "$dev_path$up/idVendor" ]]; then
-      cat "$dev_path$up/idVendor" 2>/dev/null
-      return 0
+      # readlink -f (not cd/pwd): the '..' has to be resolved PHYSICALLY, past
+      # the 'device' symlink, to reach the USB device node. A logical cd would
+      # lexically cancel 'device/..' and land back on the net iface dir.
+      readlink -f "$dev_path$up" 2>/dev/null && return 0
+      return 1
     fi
     up="$up/.."
   done
   return 1
 }
 
-nd_lte_iface() {
+nd_usb_vendor_id() {
+  local p
+  p="$(nd_usb_device_path "$1")" || return 1
+  cat "$p/idVendor" 2>/dev/null
+}
+
+# Every ZTE (vendor 19d2) network interface currently present, one per line.
+nd_lte_ifaces() {
   local iface
   for iface in eth1 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
-    if [[ "$(nd_usb_vendor_id "$iface")" == "19d2" ]]; then
-      printf '%s\n' "$iface"; return 0
-    fi
+    [[ "$(nd_usb_vendor_id "$iface" 2>/dev/null)" == "19d2" ]] && printf '%s\n' "$iface"
   done
+}
+
+# The (single) LTE network interface — first ZTE iface by name. Empty when the
+# stick is not present. Unchanged behaviour; now expressed via nd_lte_ifaces.
+nd_lte_iface() {
+  nd_lte_ifaces | head -n1
   return 0
+}
+
+# Count of DISTINCT physical ZTE modems attached. A composite (RNDIS) modem can
+# expose more than one net interface but is still ONE modem behind ONE
+# 192.168.0.1, so we de-duplicate the interfaces on their parent USB device
+# node rather than just counting interfaces. Prints an integer (0 if none).
+# This is the signal the multi-modem safety guard keys off: all MF79U units
+# default to the same 192.168.0.1 gateway, so two attached at once collide and
+# cannot be told apart.
+nd_lte_modem_count() {
+  local iface p
+  declare -A _nd_seen=()
+  while read -r iface; do
+    [[ -z "$iface" ]] && continue
+    p="$(nd_usb_device_path "$iface" 2>/dev/null)"; [[ -z "$p" ]] && p="$iface"
+    _nd_seen["$p"]=1
+  done < <(nd_lte_ifaces)
+  printf '%s\n' "${#_nd_seen[@]}"
 }
 
 # Interfaces we manage: the wifi device (hotspot/client) and the onboard
