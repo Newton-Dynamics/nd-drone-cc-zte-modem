@@ -53,7 +53,12 @@ SERVICE_DST="/etc/systemd/system/nd-uplink-manager.service"
 WEBUI_SERVICE_DST="/etc/systemd/system/nd-modem-webui.service"
 STATUS_LINK="/usr/local/bin/nd-uplink-status"
 ACTIVATE_LINK="/usr/local/bin/nd-zte-activate"
-WEBUI_PORT=8088
+# Single source of truth for the UI port: the Python default in
+# nd-modem-webui.py (ND_WEBUI_PORT env fallback). Derive it here so the verify
+# curl and the printed URLs always match what the service actually binds,
+# instead of drifting from a hard-coded constant.
+WEBUI_PORT="$(sed -n 's/.*ND_WEBUI_PORT",[[:space:]]*"\([0-9]\{1,\}\)".*/\1/p' "$WEBUI_SRC" 2>/dev/null | head -1)"
+WEBUI_PORT="${WEBUI_PORT:-7077}"
 AVAHI_CONF="/etc/avahi/avahi-daemon.conf"
 
 HOTSPOT_CON="nd-hotspot"
@@ -364,15 +369,23 @@ perform_install() {
   "$MANAGER_DST" reap || warn "Hygiene pass reported an issue (continuing)"
   ok "Hygiene pass done (see 'journalctl -t nd-uplink' for any reaped daemons)."
 
-  msg "Enabling nd-uplink-manager.service…"
-  systemctl enable --now nd-uplink-manager.service
-  ok "nd-uplink-manager.service enabled and started."
+  # enable (persist) then restart (not `enable --now`): --now is a no-op on an
+  # already-running unit, so a reinstall would keep the OLD process — and the
+  # freshly-deployed code would never take effect. restart picks up new code
+  # whether the unit was running or stopped.
+  msg "Enabling and (re)starting nd-uplink-manager.service…"
+  systemctl enable nd-uplink-manager.service >/dev/null 2>&1 || true
+  systemctl restart nd-uplink-manager.service
+  ok "nd-uplink-manager.service enabled and (re)started."
 
   # Independent of WiFi/Ethernet presence — this must stay reachable even if
   # the rest of the stack is broken, so it can be used to fix it.
-  msg "Enabling nd-modem-webui.service (config UI, port $WEBUI_PORT)…"
-  systemctl enable --now nd-modem-webui.service
-  ok "nd-modem-webui.service enabled and started."
+  # Same reasoning as above: restart so a redeployed webui (e.g. a changed
+  # port default) is actually picked up, instead of the old process lingering.
+  msg "Enabling and (re)starting nd-modem-webui.service (config UI, port $WEBUI_PORT)…"
+  systemctl enable nd-modem-webui.service >/dev/null 2>&1 || true
+  systemctl restart nd-modem-webui.service
+  ok "nd-modem-webui.service enabled and (re)started."
 
   msg "Applying LTE-only egress firewall…"
   "$MANAGER_DST" fw-apply || warn "Firewall pass reported an issue (continuing)"
