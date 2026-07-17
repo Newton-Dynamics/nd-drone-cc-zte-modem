@@ -65,10 +65,20 @@ nd_wifi_dev() {
   nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}'
 }
 
-# Onboard ethernet = ethernet device named en*/eth* but NOT a USB enx* NIC (ZTE).
+# Onboard ethernet = an ethernet NIC named en*/eth* that is NOT a ZTE modem.
+# The enx* name exclusion isn't sufficient on its own: these modems share a
+# hard-coded default MAC, so a second one enumerates as eth0 — which would
+# otherwise look exactly like an onboard NIC. Also drop anything nd_lte_ifaces
+# flags as a 19d2 modem, whatever name it took.
 nd_eth_dev() {
-  nmcli -t -f DEVICE,TYPE device 2>/dev/null \
-    | awk -F: '$2=="ethernet" && $1 ~ /^(en|eth)/ && $1 !~ /^enx/ {print $1; exit}'
+  local lte_set dev typ
+  lte_set=" $(nd_lte_ifaces 2>/dev/null | paste -sd' ' -) "
+  while IFS=: read -r dev typ; do
+    [[ "$typ" == ethernet ]] || continue
+    [[ "$dev" =~ ^(en|eth) && "$dev" != enx* ]] || continue
+    [[ "$lte_set" == *" $dev "* ]] && continue
+    printf '%s\n' "$dev"; return 0
+  done < <(nmcli -t -f DEVICE,TYPE device 2>/dev/null)
 }
 
 # The LTE network interface: a USB 'enx*' (or eth1/wwan0) whose USB vendor is
@@ -105,9 +115,15 @@ nd_usb_vendor_id() {
 }
 
 # Every ZTE (vendor 19d2) network interface currently present, one per line.
+# Detection is by USB vendor id, NOT by interface name: these modems ship with
+# an identical hard-coded MAC (34:4b:50:00:00:00), so when two are attached the
+# second cannot take an enx<MAC> name and the kernel falls back to eth0 (or
+# similar). A name-based scan would miss it — and worse, that eth0 would then
+# masquerade as an onboard NIC. So walk every interface and match on vendor.
 nd_lte_ifaces() {
   local iface
-  for iface in eth1 wwan0 $(ls /sys/class/net 2>/dev/null | grep -E '^enx'); do
+  for iface in $(ls /sys/class/net 2>/dev/null); do
+    [[ "$iface" == lo ]] && continue
     [[ "$(nd_usb_vendor_id "$iface" 2>/dev/null)" == "19d2" ]] && printf '%s\n' "$iface"
   done
 }
@@ -141,9 +157,17 @@ nd_lte_modem_count() {
 # ethernet (DHCP client/server). The LTE stick is intentionally excluded (see
 # header note).
 nd_managed_ifaces() {
-  nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '
-    $2=="wifi" { print $1 }
-    $2=="ethernet" && $1 ~ /^(en|eth)/ && $1 !~ /^enx/ { print $1 }'
+  local lte_set dev typ
+  lte_set=" $(nd_lte_ifaces 2>/dev/null | paste -sd' ' -) "
+  while IFS=: read -r dev typ; do
+    [[ -z "$dev" ]] && continue
+    # never manage a ZTE modem, whatever iface name it took (enx*, eth0, …)
+    [[ "$lte_set" == *" $dev "* ]] && continue
+    case "$typ" in
+      wifi)     printf '%s\n' "$dev" ;;
+      ethernet) [[ "$dev" =~ ^(en|eth) && "$dev" != enx* ]] && printf '%s\n' "$dev" ;;
+    esac
+  done < <(nmcli -t -f DEVICE,TYPE device 2>/dev/null)
 }
 
 nd_nm_pid() { pgrep -x NetworkManager 2>/dev/null | head -1; }
