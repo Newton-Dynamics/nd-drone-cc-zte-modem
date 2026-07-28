@@ -89,6 +89,16 @@ lte_is_active_uplink=0
 # this stays meaningful even when Ethernet/WiFi is the current uplink.
 # Binding to an interface by name needs root (SO_BINDTODEVICE) — reported as
 # unknown (null) rather than guessed at when not root.
+#
+# Target is a fixed IP (Cloudflare's 1.1.1.1, already trusted below for the
+# ping check), not a hostname: --interface binds EVERY socket for the
+# transfer to that physical device, including the one that would otherwise
+# query the local systemd-resolved stub at 127.0.0.53 — a loopback address,
+# unreachable once forced onto a non-loopback interface. Any hostname lookup
+# through this check fails for that reason alone, regardless of whether the
+# modem's data path is actually fine. See https_ok below for why the generic
+# (unbound) check moved off hostnames too.
+#
 # Backgrounded (see "wait for backgrounded network checks" below) — this,
 # the ping, and the HTTPS check are the only slow parts of this script, and
 # running them one after another rather than in parallel is what made every
@@ -98,7 +108,7 @@ _lte_data_tmp=""
 if [[ -n "$lte_iface" && "$(id -u)" == "0" ]]; then
   _lte_data_tmp=$(mktemp)
   ( curl -sSo /dev/null -w "%{http_code}" --interface "$lte_iface" --max-time 5 \
-      https://connectivity.gstatic.com/generate_204 2>/dev/null > "$_lte_data_tmp" ) &
+      https://1.1.1.1/ 2>/dev/null > "$_lte_data_tmp" ) &
   _lte_data_pid=$!
 fi
 
@@ -166,9 +176,17 @@ _ping_pid=$!
 dns_ok=0
 getent hosts google.com >/dev/null 2>&1 && dns_ok=1
 
+# Fixed IP target (not a hostname): on at least one network we've seen this
+# run on, the local DNS server flat-out refuses to resolve Google's
+# captive-portal-check hostnames (connectivity.gstatic.com) — a real NXDOMAIN
+# from that network's resolver, not a script bug (deliberate filtering of
+# exactly these domains is common on managed/corporate networks, to suppress
+# "sign in to network" prompts). A hostname-based check is at the mercy of
+# whatever DNS policy the current network enforces; testing a fixed IP this
+# script already trusts for the ping check above sidesteps that entirely.
 _https_tmp=$(mktemp)
 ( curl -sSo /dev/null -w "%{http_code}" --max-time 5 \
-    https://connectivity.gstatic.com/generate_204 2>/dev/null > "$_https_tmp" ) &
+    https://1.1.1.1/ 2>/dev/null > "$_https_tmp" ) &
 _https_pid=$!
 
 # --- LAN egress (LTE-only policy) --------------------------------------------
@@ -199,13 +217,18 @@ rm -f "$_ping_tmp"
 wait "$_https_pid" 2>/dev/null
 https_code=$(cat "$_https_tmp" 2>/dev/null)
 rm -f "$_https_tmp"
+# Any real HTTP response (not curl's "000" no-response sentinel) is proof of
+# a genuine, un-intercepted TLS path to a real internet host — a captive
+# portal or transparent proxy can't complete a valid TLS handshake for an IP
+# it doesn't hold a certificate for, so we don't need to match one specific
+# status code the way the old generate_204 check did.
 https_ok=0
-[[ "$https_code" == "204" ]] && https_ok=1
+[[ -n "$https_code" && "$https_code" != "000" ]] && https_ok=1
 
 if [[ -n "$_lte_data_tmp" ]]; then
   wait "$_lte_data_pid" 2>/dev/null
   lte_data_code=$(cat "$_lte_data_tmp" 2>/dev/null)
-  [[ "$lte_data_code" == "204" ]] && lte_data_ok=1 || lte_data_ok=0
+  [[ -n "$lte_data_code" && "$lte_data_code" != "000" ]] && lte_data_ok=1 || lte_data_ok=0
   rm -f "$_lte_data_tmp"
 fi
 
@@ -357,7 +380,7 @@ else
 fi
 [[ -n "$rtt" ]] && line_ok "Ping 1.1.1.1 — avg ${rtt} ms" || line_no "Ping 1.1.1.1 — unreachable"
 (( dns_ok )) && line_ok "DNS resolution OK" || line_no "DNS resolution FAILED"
-(( https_ok )) && line_ok "HTTPS connectivity OK (204)" || line_no "HTTPS connectivity FAILED (${https_code:-timeout})"
+(( https_ok )) && line_ok "HTTPS connectivity OK (${https_code})" || line_no "HTTPS connectivity FAILED (${https_code:-timeout})"
 
 if (( VERBOSE )); then
   echo
