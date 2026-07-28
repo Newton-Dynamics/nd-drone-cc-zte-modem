@@ -10,12 +10,15 @@
 #                         dispatcher/00-nd-nm-dispatcher-zte-modem.sh on
 #                         interface up, or manually via `nd-zte-activate` /
 #                         the config web UI's "run unlock now" button.
-#   --test-login <pass>  one login attempt against whatever modem is
-#                         currently reachable, no SIM/PIN touched. Used by
-#                         nd-modem-webui right when a modem is added, so a
-#                         typo is caught immediately instead of at the next
-#                         real unlock. Prints one JSON line: {"ok":true,
-#                         "imei":"..."} or {"ok":false,"error":"..."}.
+#   --test-login <pass> [host]
+#                         one login attempt against the given host (or the
+#                         global default if omitted), no SIM/PIN touched.
+#                         Used by nd-modem-webui right when a modem is added
+#                         (before it has a modems.json entry of its own to
+#                         look a per-modem host up from), so a typo is caught
+#                         immediately instead of at the next real unlock.
+#                         Prints one JSON line: {"ok":true,"imei":"..."} or
+#                         {"ok":false,"error":"..."}.
 #   --test-pin <pin>     resolves the modem the same way the real flow does
 #                         (pre-auth IMEI probe -> modems.json, else the
 #                         config UI's active modem), logs in, and attempts
@@ -27,9 +30,18 @@
 # Credentials come from two lookup tables managed by nd-modem-webui (never
 # from a single fixed .env anymore — a drone may see several modems/SIMs
 # over its life):
-#   modems.json = [{"imei": "...", "password": "...", "label": "..."}, ...]
+#   modems.json = [{"imei","password","label","zte_host"(optional)}, ...]
 #   sims.json   = [{"imsi": "...", "pin": "...", "label": "..."}, ...]
 #   active.json = {"modem_imei": "...", "sim_imsi": "..."}  (fallback/last-known)
+#   config.json = {"zte_host": "..."}  (default modem WebUI IP; absent/null -> 192.168.0.1)
+#
+# A modem's own "zte_host" (set per-entry via the config UI) overrides the
+# global default for that specific unit — most MF79U units answer on
+# 192.168.0.1, but some units/firmware variants use a different subnet.
+# Since identification has to happen before we know WHICH registered modem is
+# plugged in, the live-IMEI probe tries every distinct host in play (the
+# global default, then each registered modem's override) until one answers —
+# see candidate_hosts()/probe_live_imei().
 #
 # Identification always happens BEFORE any login/PIN attempt — never guess
 # across stored credentials against the live device: a wrong WebUI password
@@ -43,10 +55,6 @@ set -Eeuo pipefail
 LOGTAG="nd-zte"
 COOKIE_PATH=/tmp/zte_cookies.txt
 
-# Fixed for this project — all MF79U units here default to this WebUI IP when
-# USB-tethered, and the login endpoint never actually took a username.
-ZTE_HOST="192.168.0.1"
-
 # Resolve the directory of this script (handles symlinks, e.g. nd-zte-activate)
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -59,8 +67,25 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 MODEMS_DB="${ND_MODEMS_DB:-$SCRIPT_DIR/modems.json}"
 SIMS_DB="${ND_SIMS_DB:-$SCRIPT_DIR/sims.json}"
 ACTIVE_DB="${ND_ACTIVE_DB:-$SCRIPT_DIR/active.json}"
+CONFIG_DB="${ND_CONFIG_DB:-$SCRIPT_DIR/config.json}"
 DB_LOCK="${ND_DB_LOCK:-$SCRIPT_DIR/db.lock}"
 MODEM_LOCK="${ND_MODEM_LOCK:-$SCRIPT_DIR/modem.lock}"
+
+# Modem WebUI host — the DEFAULT/first candidate only. Most MF79U units
+# answer on 192.168.0.1 when USB-tethered, but some units/firmware variants
+# use a different subnet (e.g. 192.168.144.10), set per-modem in modems.json
+# (see candidate_hosts()) or globally in config.json's "zte_host" field (same
+# file/lock discipline as modems.json), managed through the config UI.
+# ND_ZTE_HOST env var is a lower-priority override for the global default
+# (e.g. one-off manual testing); config.json wins when both are set. probe_
+# live_imei() mutates $ZTE_HOST once it finds which host actually answers —
+# every function below always uses "whichever host we're currently talking
+# to", not this initial value. The login endpoint never took a username.
+ZTE_HOST="192.168.0.1"
+[[ -n "${ND_ZTE_HOST:-}" ]] && ZTE_HOST="$ND_ZTE_HOST"
+_cfg_zte_host="$([[ -r "$CONFIG_DB" ]] && jq -r '.zte_host // empty' "$CONFIG_DB" 2>/dev/null || true)"
+[[ -n "$_cfg_zte_host" ]] && ZTE_HOST="$_cfg_zte_host"
+unset _cfg_zte_host
 
 # Best-effort shared helpers — used only for the multi-modem advisory below.
 # Sourcing must never be fatal: this script has to keep working (unlock the one
@@ -79,29 +104,74 @@ log() { logger -t "$LOGTAG" -- "$*"; }
 exec 7>"$MODEM_LOCK"
 flock 7
 
-UAHDRS=(
-  -H "Origin: http://$ZTE_HOST"
-  -H "Referer: http://$ZTE_HOST/index.html"
-  -H "X-Requested-With: XMLHttpRequest"
-  -H "Accept: application/json, text/javascript, */*; q=0.01"
-  -H "Accept-Language: de-DE,de;q=0.9,en;q=0.8"
-  -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
-  -H "Connection: keep-alive"
-)
-
-# Bare unauthenticated single-field read (same style as the LD/RD fetches
-# that were already proven to work without a session).
+# Bare unauthenticated single-field read against a given host (default:
+# whichever host we're currently resolved to). Bounded so an unreachable
+# modem fails fast instead of hanging on curl's default TCP connect timeout
+# (~2 minutes).
 fetch_unauth() {
-  curl -s --header "Referer: http://$ZTE_HOST/index.html" \
-    "$ZTE_HOST/goform/goform_get_cmd_process?cmd=$1"
+  local host="${2:-$ZTE_HOST}"
+  curl -s --connect-timeout 2 --max-time 3 \
+    --header "Referer: http://$host/index.html" \
+    "$host/goform/goform_get_cmd_process?cmd=$1"
+}
+
+# Every distinct WebUI host currently in play: the resolved default first
+# (fast path — matches the common case), then each registered modem's own
+# "zte_host" override, deduped. We can't know in advance which registered
+# modem (if any) is physically plugged in, so identification has to be
+# willing to check every host any of them might be answering on.
+candidate_hosts() {
+  printf '%s\n' "$ZTE_HOST"
+  [[ -r "$MODEMS_DB" ]] && jq -r '.[].zte_host // empty' "$MODEMS_DB" 2>/dev/null
+}
+
+# Read the live IMEI, trying every candidate host in turn (2 attempts each,
+# 1s apart) — right after the interface comes up (or the modem is freshly
+# plugged in) its web server can take a few seconds to start answering, so a
+# single attempt would often report "unreadable" moments before the modem
+# was ready to respond. On success, sets $ZTE_HOST to the host that actually
+# answered plus $PROBED_IMEI (never echoed — must be CALLED DIRECTLY, never
+# via $(...): a command substitution forks a subshell, and the $ZTE_HOST
+# mutation would be silently lost the moment it returned, leaving every
+# later call talking to the wrong host). Callers wrapping this in an
+# external timeout (webui's --test-pin) must leave enough headroom above
+# (attempts x hosts) for login + telemetry + ENTER_PIN afterward.
+probe_live_imei() {
+  local host imei attempt seen=" "
+  PROBED_IMEI=""
+  while IFS= read -r host; do
+    [[ -z "$host" || "$seen" == *" $host "* ]] && continue
+    seen="$seen$host "
+    for attempt in 1 2; do
+      imei=$(fetch_unauth imei "$host" | grep -oP '(?<="imei":")[^"]+' || true)
+      if [[ -n "$imei" ]]; then
+        ZTE_HOST="$host"
+        PROBED_IMEI="$imei"
+        return 0
+      fi
+      (( attempt < 2 )) && sleep 1
+    done
+  done < <(candidate_hosts)
+  return 0
 }
 
 # Query the modem's goform API for full status/telemetry, merging every
 # response into one JSON object. Each distinct field set is fetched once.
+# Headers are (re)built fresh from $ZTE_HOST on every call, never cached at
+# script start — probe_live_imei() may have since switched hosts.
 collect_modem_data() {
   local epoch_ms
   epoch_ms=$(date +%s%3N)
   local -a responses=()
+  local -a UAHDRS=(
+    -H "Origin: http://$ZTE_HOST"
+    -H "Referer: http://$ZTE_HOST/index.html"
+    -H "X-Requested-With: XMLHttpRequest"
+    -H "Accept: application/json, text/javascript, */*; q=0.01"
+    -H "Accept-Language: de-DE,de;q=0.9,en;q=0.8"
+    -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
+    -H "Connection: keep-alive"
+  )
 
   responses+=("$(curl -s "$ZTE_HOST/goform/goform_get_cmd_process?isTest=false&cmd=privacy_read_flag&multi_data=1&_=$epoch_ms" "${UAHDRS[@]}")")
   responses+=("$(curl -s "$ZTE_HOST/goform/goform_get_cmd_process?isTest=false&cmd=modem_main_state,pin_status,opms_wan_mode,opms_wan_auto_mode,loginfo,new_version_state,current_upgrade_state,is_mandatory,wifi_dfs_status,battery_value,ppp_dial_conn_fail_counter,dhcp_wan_status,signalbar,network_type,network_provider,battery_charg_type,external_charging_flag,mode_main_state,battery_temp,SSID1,ppp_status,EX_SSID1,sta_ip_status,EX_wifi_profile,m_ssid_enable,RadioOff,wifi_onoff_state,wifi_chip1_ssid1_ssid,wifi_chip2_ssid1_ssid,wifi_chip1_ssid1_access_sta_num,wifi_chip2_ssid1_access_sta_num,simcard_roam,lan_ipaddr,station_mac,wifi_access_sta_num,battery_charging,battery_vol_percent,battery_pers,spn_name_data,spn_b1_flag,spn_b2_flag,realtime_tx_bytes,realtime_rx_bytes,realtime_time,realtime_tx_thrpt,realtime_rx_thrpt,monthly_rx_bytes,monthly_tx_bytes,monthly_time,date_month,data_volume_limit_switch,data_volume_limit_size,data_volume_alert_percent,data_volume_limit_unit,roam_setting_option,upg_roam_switch,ssid,wifi_enable,wifi_5g_enable,check_web_conflict,dial_mode,ppp_dial_conn_fail_counter,wan_lte_ca,privacy_read_flag,is_night_mode,pppoe_status,dhcp_wan_status,static_wan_status,vpn_conn_status,wan_connect_status,wifi_chip1_ssid2_access_sta_num,wifi_chip2_ssid2_access_sta_num&multi_data=1&_=$epoch_ms" "${UAHDRS[@]}")")
@@ -121,6 +191,9 @@ collect_modem_data() {
 
 modem_password_for_imei() {
   jq -r --arg imei "$1" '[.[] | select(.imei == $imei)][0].password // empty' "$MODEMS_DB"
+}
+modem_host_for_imei() {
+  jq -r --arg imei "$1" '[.[] | select(.imei == $imei)][0].zte_host // empty' "$MODEMS_DB"
 }
 sim_pin_for_imsi() {
   jq -r --arg imsi "$1" '[.[] | select(.imsi == $imsi)][0].pin // empty' "$SIMS_DB"
@@ -155,12 +228,17 @@ resolve_modem() {
     return 1
   fi
 
-  local fallback_imei
+  local fallback_imei fallback_host
   fallback_imei="$(active_modem_imei)"
   if [[ -n "$fallback_imei" ]]; then
     password=$(modem_password_for_imei "$fallback_imei")
     if [[ -n "$password" ]]; then
       RESOLVED_IMEI="$fallback_imei"; RESOLVED_PASSWORD="$password"
+      # No live probe means candidate_hosts() never ran, so $ZTE_HOST is
+      # still just the global default — apply this modem's own override, if
+      # it has one, since that's the host we're about to log into blind.
+      fallback_host="$(modem_host_for_imei "$fallback_imei")"
+      [[ -n "$fallback_host" ]] && ZTE_HOST="$fallback_host"
       log "Pre-auth IMEI probe unavailable — using config-UI active modem (IMEI $fallback_imei) without pre-verification."
       return 0
     fi
@@ -255,10 +333,15 @@ enter_pin() {
 }
 
 # ==============================================================================
-# --test-login <password> — one login attempt, no SIM/PIN touched.
+# --test-login <password> [host] — one login attempt, no SIM/PIN touched.
+# [host]: used when adding a modem that isn't registered yet (so it has no
+# modems.json entry to look a zte_host override up from) — the config UI
+# passes whatever the operator entered/detected. Falls back to the global
+# default if omitted, same as before this existed.
 # ==============================================================================
 if [[ "${1:-}" == "--test-login" ]]; then
   test_password="${2:?--test-login requires a password argument}"
+  [[ -n "${3:-}" ]] && ZTE_HOST="$3"
   if do_login "$test_password"; then
     live_imei=$(fetch_unauth imei | grep -oP '(?<="imei":")[^"]+' || true)
     printf '{"ok":true,"imei":"%s"}\n' "$live_imei"
@@ -276,8 +359,8 @@ if [[ "${1:-}" == "--test-pin" ]]; then
   for f in "$MODEMS_DB" "$SIMS_DB"; do
     [[ -r "$f" ]] || { printf '{"ok":false,"error":"%s not found"}\n' "$f"; exit 1; }
   done
-  live_imei_probe=$(fetch_unauth imei | grep -oP '(?<="imei":")[^"]+' || true)
-  if ! resolve_modem "$live_imei_probe"; then
+  probe_live_imei
+  if ! resolve_modem "$PROBED_IMEI"; then
     printf '{"ok":false,"error":"no identifiable/active modem to test against"}\n'
     exit 1
   fi
@@ -335,8 +418,8 @@ if declare -f nd_lte_modem_count >/dev/null 2>&1; then
 fi
 
 # Step 1+2: identify the connected modem BEFORE attempting any login
-LIVE_IMEI=$(fetch_unauth imei | grep -oP '(?<="imei":")[^"]+' || true)
-if ! resolve_modem "$LIVE_IMEI"; then
+probe_live_imei
+if ! resolve_modem "$PROBED_IMEI"; then
   exit 1
 fi
 

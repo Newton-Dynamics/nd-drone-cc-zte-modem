@@ -54,9 +54,18 @@ nd_check_deps() {
     return 0
   fi
   warn "Missing: ${missing[*]}"
-  if [[ "$mode" == "install" ]] && command -v apt-get >/dev/null 2>&1; then
-    msg "Attempting apt-get install…"
-    apt-get update -qq && apt-get install -y "${missing[@]}" || warn "Automatic install failed — install manually."
+  if [[ "$mode" == "install" ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      msg "Attempting apt-get install…"
+      apt-get update -qq && apt-get install -y "${missing[@]}" || true
+    fi
+    local still_missing=()
+    for d in "${missing[@]}"; do command -v "$d" >/dev/null 2>&1 || still_missing+=("$d"); done
+    if (( ${#still_missing[@]} > 0 )); then
+      err "Still missing after automatic install attempt: ${still_missing[*]} — install manually (e.g. 'sudo apt update && sudo apt install ${still_missing[*]}') and re-run."
+      return 1
+    fi
+    ok "All required tools present."
   fi
 }
 

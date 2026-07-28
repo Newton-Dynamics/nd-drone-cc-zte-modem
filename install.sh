@@ -45,6 +45,7 @@ MODEM_DST="$ND_DIR/modem/nd-zte-modem.sh"
 MODEMS_DB="$ND_DIR/modem/modems.json"
 SIMS_DB="$ND_DIR/modem/sims.json"
 ACTIVE_DB="$ND_DIR/modem/active.json"
+CONFIG_DB="$ND_DIR/modem/config.json"
 MANAGER_DST="$ND_DIR/net/nd-uplink-manager.sh"
 STATUS_DST="$ND_DIR/bin/nd-uplink-status.sh"
 WEBUI_DST="$ND_DIR/webui/nd-modem-webui.py"
@@ -297,6 +298,7 @@ deploy_files() {
     [[ -f "$f" ]] || { echo '[]' > "$f"; chmod 600 "$f"; }
   done
   [[ -f "$ACTIVE_DB" ]] || { echo '{}' > "$ACTIVE_DB"; chmod 600 "$ACTIVE_DB"; }
+  [[ -f "$CONFIG_DB" ]] || { echo '{}' > "$CONFIG_DB"; chmod 600 "$CONFIG_DB"; }
   ok "Modem/SIM tables ready — add entries via the config UI."
 
   msg "Installing NetworkManager dispatcher hook…"

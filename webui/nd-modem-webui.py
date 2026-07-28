@@ -13,6 +13,7 @@ Data files (shared with modem/nd-zte-modem.sh, same lock discipline):
   <MODEM_DIR>/modems.json  [{"imei","password","label"}, ...]
   <MODEM_DIR>/sims.json    [{"imsi","pin","label"}, ...]
   <MODEM_DIR>/active.json  {"modem_imei","sim_imsi"}
+  <MODEM_DIR>/config.json  {"zte_host": "..."}  (absent/null "zte_host" -> default)
   <MODEM_DIR>/db.lock      flock guard around any read-modify-write
 
 Never echoes a stored password/PIN back over the API — list endpoints report
@@ -33,9 +34,14 @@ MODEM_DIR = os.environ.get("ND_MODEM_DIR", "/opt/nd-uplink/modem")
 MODEMS_DB = os.path.join(MODEM_DIR, "modems.json")
 SIMS_DB = os.path.join(MODEM_DIR, "sims.json")
 ACTIVE_DB = os.path.join(MODEM_DIR, "active.json")
+CONFIG_DB = os.path.join(MODEM_DIR, "config.json")
 DB_LOCK = os.path.join(MODEM_DIR, "db.lock")
 
-ZTE_HOST = os.environ.get("ND_ZTE_HOST", "192.168.0.1")
+# Fallback when config.json has no "zte_host" of its own — same env-var
+# override nd-zte-modem.sh honors. Most units default to 192.168.0.1; some
+# units/firmware variants answer on a different subnet (e.g. 192.168.144.10),
+# set persistently via config.json (see current_zte_host()).
+DEFAULT_ZTE_HOST = os.environ.get("ND_ZTE_HOST", "192.168.0.1")
 STATUS_CMD = os.environ.get("ND_STATUS_CMD", "nd-uplink-status")
 ACTIVATE_CMD = os.environ.get("ND_ACTIVATE_CMD", "nd-zte-activate")
 MODEM_SCRIPT = os.environ.get("ND_MODEM_SCRIPT", os.path.join(MODEM_DIR, "nd-zte-modem.sh"))
@@ -107,8 +113,63 @@ def write_active(patch):
     return active
 
 
+def read_config():
+    if not os.path.exists(CONFIG_DB):
+        return {}
+    with open(CONFIG_DB) as f:
+        return json.load(f)
+
+
+def write_config(patch):
+    with LockedFile(DB_LOCK):
+        config = read_config()
+        config.update(patch)
+        tmp = f"{CONFIG_DB}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(config, f, indent=2)
+        os.replace(tmp, CONFIG_DB)
+        os.chmod(CONFIG_DB, 0o600)
+    return config
+
+
+def current_zte_host():
+    return read_config().get("zte_host") or DEFAULT_ZTE_HOST
+
+
+def _valid_ipv4(host):
+    parts = host.split(".")
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+
+def set_config(payload):
+    host = str(payload.get("zte_host", "")).strip()
+    if host and not _valid_ipv4(host):
+        raise ApiError(400, "zte_host must be a valid IPv4 address")
+    write_config({"zte_host": host or None})
+    return {"zte_host": current_zte_host(), "default_zte_host": DEFAULT_ZTE_HOST}
+
+
 def modem_public(m):
-    return {"imei": m["imei"], "label": m.get("label", ""), "password_set": bool(m.get("password"))}
+    return {
+        "imei": m["imei"],
+        "label": m.get("label", ""),
+        "password_set": bool(m.get("password")),
+        "zte_host": m.get("zte_host") or "",
+    }
+
+
+def candidate_hosts():
+    """Every distinct WebUI host currently in play: the global default first,
+    then each registered modem's own override, deduped. Mirrors
+    nd-zte-modem.sh's candidate_hosts() — we can't know which registered
+    modem (if any) is physically plugged in, so Detect has to be willing to
+    check every host any of them might be answering on."""
+    hosts = [current_zte_host()]
+    for m in read_modems():
+        h = m.get("zte_host")
+        if h and h not in hosts:
+            hosts.append(h)
+    return hosts
 
 
 def sim_public(s):
@@ -140,39 +201,52 @@ def run_modem_script(args, timeout=25):
         return {"ok": False, "error": str(e)}
 
 
-def test_modem_login(password):
-    return run_modem_script(["--test-login", password])
+def test_modem_login(password, host=None):
+    args = ["--test-login", password]
+    if host:
+        args.append(host)
+    return run_modem_script(args)
 
 
 def test_modem_pin(pin):
-    return run_modem_script(["--test-pin", pin])
+    # --test-pin resolves the modem via probe_live_imei()'s per-candidate-host
+    # retry budget (~8s per host) before it even logs in, so the default 25s
+    # wrapper timeout doesn't leave enough headroom for login + telemetry +
+    # ENTER_PIN on top of that once more than one host is in play — bump it
+    # so a slow-to-boot modem gets killed by the script's own logic (a clean
+    # {"ok":false}), never by this wrapper mid-PIN-attempt.
+    return run_modem_script(["--test-pin", pin], timeout=45)
 
 
 def add_modem(payload):
     imei = str(payload.get("imei", "")).strip()
     password = str(payload.get("password", ""))
     label = str(payload.get("label", "")).strip()
+    zte_host = str(payload.get("zte_host", "")).strip()
     if not imei:
         raise ApiError(400, "imei is required")
     if not re.fullmatch(r"\d{6,20}", imei):
         raise ApiError(400, "imei must be 6-20 digits")
     if not password:
         raise ApiError(400, "password is required")
+    if zte_host and not _valid_ipv4(zte_host):
+        raise ApiError(400, "zte_host must be a valid IPv4 address")
 
     # One real login attempt against whatever's plugged in right now, so a
     # typo is caught immediately instead of surfacing later during a real
     # unlock. Never blocks the save — you may be pre-registering a modem
-    # that isn't physically connected yet.
-    login_test = test_modem_login(password)
+    # that isn't physically connected yet. Targets the entered/detected host
+    # directly (this modem has no lookup-table entry yet to resolve one from).
+    login_test = test_modem_login(password, host=zte_host or None)
     if login_test.get("ok") and login_test.get("imei") and login_test["imei"] != imei:
         login_test["imei_mismatch"] = True
 
     with LockedFile(DB_LOCK):
         modems = read_modems()
         modems = [m for m in modems if m["imei"] != imei]
-        modems.append({"imei": imei, "password": password, "label": label})
+        modems.append({"imei": imei, "password": password, "label": label, "zte_host": zte_host})
         _write_list(MODEMS_DB, modems)
-    result = modem_public({"imei": imei, "password": password, "label": label})
+    result = modem_public({"imei": imei, "password": password, "label": label, "zte_host": zte_host})
     result["login_test"] = login_test
     return result
 
@@ -238,17 +312,31 @@ def activate_sim(imsi):
 
 
 # --- best-effort unauthenticated modem IMEI probe (mirrors nd-zte-modem.sh) -
+#
+# A single short-timeout attempt was unreliable: right after a modem is
+# plugged in (or an interface just came up) its web server can take a few
+# seconds to start answering, so one short try would often race it and
+# report "not available" even though the modem was about to respond. Retry
+# each candidate host across a ~8s budget before moving to the next one —
+# most units answer on the global default, but some units/firmware variants
+# use a different subnet, tracked per-modem in modems.json (candidate_hosts()).
 
-def detect_modem_imei(timeout=4):
-    url = f"http://{ZTE_HOST}/goform/goform_get_cmd_process?cmd=imei"
-    req = urllib.request.Request(url, headers={"Referer": f"http://{ZTE_HOST}/index.html"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", "replace")
-        m = re.search(r'"imei"\s*:\s*"([^"]+)"', body)
-        return m.group(1) if m else None
-    except Exception:
-        return None
+def detect_modem_imei(attempts_per_host=3, per_attempt_timeout=2, delay=1):
+    for host in candidate_hosts():
+        url = f"http://{host}/goform/goform_get_cmd_process?cmd=imei"
+        req = urllib.request.Request(url, headers={"Referer": f"http://{host}/index.html"})
+        for attempt in range(attempts_per_host):
+            try:
+                with urllib.request.urlopen(req, timeout=per_attempt_timeout) as resp:
+                    body = resp.read().decode("utf-8", "replace")
+                m = re.search(r'"imei"\s*:\s*"([^"]+)"', body)
+                if m:
+                    return {"imei": m.group(1), "zte_host": host}
+            except Exception:
+                pass
+            if attempt < attempts_per_host - 1:
+                time.sleep(delay)
+    return {"imei": None, "zte_host": None}
 
 
 # --- HTTP handler ------------------------------------------------------------
@@ -330,8 +418,15 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/api/active":
                 self._send_json(200, read_active())
                 return
+            if path == "/api/config":
+                if method == "GET":
+                    self._send_json(200, {"zte_host": current_zte_host(), "default_zte_host": DEFAULT_ZTE_HOST})
+                    return
+                if method == "POST":
+                    self._send_json(200, set_config(self._read_json_body()))
+                    return
             if method == "GET" and path == "/api/detect":
-                self._send_json(200, {"imei": detect_modem_imei()})
+                self._send_json(200, detect_modem_imei())
                 return
             if method == "POST" and path == "/api/unlock":
                 subprocess.Popen(
@@ -427,15 +522,25 @@ INDEX_HTML = r"""<!doctype html>
 <h2>Uplink status</h2>
 <table id="statusTable"><tbody><tr><td colspan="2"><span class="spinner"></span>Loading…</td></tr></tbody></table>
 
+<h2>Modem network settings</h2>
+<form class="inline" id="configForm">
+  <input name="zte_host" id="zteHostInput" placeholder="192.168.0.1">
+  <button type="submit">Save</button>
+</form>
+<div id="configResult" class="test-result"></div>
+<p class="muted">Modem WebUI address. Leave blank to use the default. Most MF79U units use 192.168.0.1; some units/firmware variants answer on a different subnet (e.g. 192.168.144.10).</p>
+
 <h2>Modems</h2>
-<table id="modemsTable"><thead><tr><th>Label</th><th>IMEI</th><th>Password</th><th>Active</th><th></th></tr></thead><tbody></tbody></table>
+<table id="modemsTable"><thead><tr><th>Label</th><th>IMEI</th><th>Host</th><th>Password</th><th>Active</th><th></th></tr></thead><tbody></tbody></table>
 <form class="inline" id="addModemForm">
   <input name="label" placeholder="Label (e.g. Modem A)">
   <input name="imei" placeholder="IMEI" required>
   <button type="button" id="detectImei">Detect</button>
   <input name="password" type="password" placeholder="WebUI password" required>
+  <input name="zte_host" id="modemHostInput" placeholder="IP (default)">
   <button type="submit">Add modem</button>
 </form>
+<p class="muted">IP only needed if this specific unit doesn't answer on the default above (Detect fills it in automatically when it finds one elsewhere).</p>
 <div id="modemTestResult" class="test-result"></div>
 
 <h2>SIM cards</h2>
@@ -536,14 +641,15 @@ async function refreshModems() {
       <tr>
         <td>${m.label || ''}</td>
         <td>${m.imei}</td>
+        <td>${m.zte_host || '<span class="muted">(default)</span>'}</td>
         <td>${m.password_set ? pill(true, 'set') : pill(false, 'missing')}</td>
         <td>${active.modem_imei === m.imei ? pill(true, 'active') : `<button data-imei="${m.imei}" class="activateModem">make active</button>`}</td>
         <td><button data-imei="${m.imei}" class="danger deleteModem">delete</button></td>
-      </tr>`).join('') || '<tr><td colspan="5" class="muted">No modems registered yet.</td></tr>';
+      </tr>`).join('') || '<tr><td colspan="6" class="muted">No modems registered yet.</td></tr>';
     tbody.querySelectorAll('.deleteModem').forEach(b => b.onclick = async () => { await api(`/api/modems/${b.dataset.imei}`, {method: 'DELETE'}); refreshModems(); });
     tbody.querySelectorAll('.activateModem').forEach(b => b.onclick = async () => { await api(`/api/modems/${b.dataset.imei}/activate`, {method: 'POST'}); refreshModems(); });
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="5">modems unavailable: ${e.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6">modems unavailable: ${e.message}</td></tr>`;
   }
 }
 
@@ -572,6 +678,12 @@ document.getElementById('detectImei').onclick = async () => {
   try {
     const r = await api('/api/detect');
     document.querySelector('#addModemForm input[name=imei]').value = r.imei || '';
+    // Only pre-fill the per-modem host override when the modem answered
+    // somewhere OTHER than the current default — leaving it blank there
+    // keeps "blank = default" meaningful even if the global default changes
+    // later.
+    document.getElementById('modemHostInput').value =
+      (r.zte_host && r.zte_host !== currentDefaultZteHost) ? r.zte_host : '';
     btn.textContent = r.imei ? 'Detect' : 'Not available';
   } catch (e) { btn.textContent = 'Detect'; alert(e.message); }
   setTimeout(() => btn.textContent = 'Detect', 2000);
@@ -582,6 +694,29 @@ function showTestResult(elId, ok, text) {
   el.className = 'test-result ' + (ok ? 'ok' : 'bad');
   el.textContent = text;
 }
+
+let currentDefaultZteHost = null;
+async function refreshConfig() {
+  const c = await api('/api/config');
+  currentDefaultZteHost = c.default_zte_host;
+  const input = document.getElementById('zteHostInput');
+  input.value = c.zte_host === c.default_zte_host ? '' : c.zte_host;
+  input.placeholder = c.default_zte_host;
+  document.getElementById('modemHostInput').placeholder = `IP (default: ${c.default_zte_host})`;
+}
+
+document.getElementById('configForm').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const zte_host = ev.target.zte_host.value.trim();
+  try {
+    await api('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({zte_host})});
+    await refreshConfig();
+    showTestResult('configResult', true, 'Saved.');
+  } catch (e) {
+    showTestResult('configResult', false, 'Not saved: ' + e.message);
+  }
+};
 
 document.getElementById('addModemForm').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -656,7 +791,7 @@ async function refreshServiceLog() {
 document.getElementById('refreshServiceLog').onclick = refreshServiceLog;
 document.getElementById('serviceSelect').onchange = refreshServiceLog;
 
-refreshStatus(); refreshModems(); refreshSims(); refreshUnlockLog(); refreshServiceLog();
+refreshStatus(); refreshConfig(); refreshModems(); refreshSims(); refreshUnlockLog(); refreshServiceLog();
 setInterval(refreshStatus, 15000);
 </script>
 </body>
@@ -706,25 +841,57 @@ def _managed_lan_addresses(retries=BIND_RETRIES, delay=BIND_DELAY):
     return []
 
 
+# LAN addresses can change after this service has already started — e.g.
+# nd-uplink-manager probing for an upstream DHCP server on the onboard
+# ethernet at boot: it may bring the interface up with the DHCP-server
+# fallback address first, then switch it to a real client lease seconds
+# later once the probe resolves. Binding once at startup can freeze this
+# service on a since-abandoned address, unreachable at the device's actual
+# current IP (or its .local mDNS name) until restarted by hand. Re-scan
+# periodically and add/drop listener sockets so it keeps following whatever
+# this device is actually reachable at.
+RESCAN_INTERVAL = float(os.environ.get("ND_WEBUI_RESCAN_INTERVAL", "30"))
+
+
 def main():
-    addresses = ["127.0.0.1"] + _managed_lan_addresses()
-    servers = []
-    for addr in dict.fromkeys(addresses):  # de-dup, preserve order
+    import threading
+    servers = {}
+
+    def bind_and_serve(addr):
         try:
             srv = ThreadingHTTPServer((addr, PORT), Handler)
-            servers.append(srv)
-            print(f"nd-modem-webui: listening on http://{addr}:{PORT}", file=sys.stderr)
         except OSError as e:
             print(f"nd-modem-webui: could not bind {addr}:{PORT} ({e}) — skipping", file=sys.stderr)
+            return None
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"nd-modem-webui: listening on http://{addr}:{PORT}", file=sys.stderr)
+        return srv
+
+    for addr in dict.fromkeys(["127.0.0.1"] + _managed_lan_addresses()):
+        srv = bind_and_serve(addr)
+        if srv:
+            servers[addr] = srv
 
     if not servers:
         print("nd-modem-webui: no addresses could be bound — exiting", file=sys.stderr)
         sys.exit(1)
 
-    import threading
-    for srv in servers[1:]:
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-    servers[0].serve_forever()
+    def rescan_loop():
+        while True:
+            time.sleep(RESCAN_INTERVAL)
+            current = set(_managed_lan_addresses(retries=1)) | {"127.0.0.1"}
+            for addr in current - servers.keys():
+                srv = bind_and_serve(addr)
+                if srv:
+                    servers[addr] = srv
+            for addr in list(servers.keys() - current):
+                srv = servers.pop(addr)
+                srv.shutdown()
+                srv.server_close()
+                print(f"nd-modem-webui: {addr} no longer present — stopped listening", file=sys.stderr)
+
+    threading.Thread(target=rescan_loop, daemon=True).start()
+    threading.Event().wait()
 
 
 if __name__ == "__main__":
